@@ -357,6 +357,20 @@ def clear_cross_link_on_src(src_store: dict, src_pid: str | int, dst_store_name:
         delete_mf(src_store["domain"], src_store["token"], mfid)
 
 
+def delete_on_dst_by_crosslink(src_store: dict, dst_store: dict, src_pid: str | int) -> bool:
+    """Delete destination only if this source has a valid cross-link; never by SKUs."""
+    dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, src_pid)
+    if not dst_pid:
+        return False
+    if not product_exists(dst_store["domain"], dst_store["token"], dst_pid):
+        return False
+    info(f"[delete] removing PID {dst_pid} from {dst_store['name']} (by cross-link)")
+    delete_product(dst_store["domain"], dst_store["token"], dst_pid)
+    # clear cross-link on source so it can be recreated later
+    clear_cross_link_on_src(src_store, src_pid, dst_store["name"])
+    return True
+
+
 # =========================================================
 # Retry wrappers for product PUT/POST
 # =========================================================
@@ -664,94 +678,91 @@ def sync_variant_prices_from_src_to_dst(src_prod: dict, dst_store: dict):
 
 
 # =========================================================
-# Media sync helpers (one-way: TAF -> AFL only)
+# SKU late-add helpers (match by options/position)
 # =========================================================
-def _sync_images(src_store: dict, dst_store: dict, src_prod: dict, dst_pid: str | int):
-    if src_store["name"] != "TAF":
-        return  # do not sync media from AFL -> TAF
-    src_images = _norm_images(src_prod)
-    info(f"[media] syncing {len(src_images)} images {src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
-    try:
-        delete_all_images(dst_store["domain"], dst_store["token"], dst_pid)
-        for idx, src in enumerate(src_images, start=1):
-            add_image(dst_store["domain"], dst_store["token"], dst_pid, src, idx)
-    except Exception as e:
-        warn(f"[media] image sync error: {e}")
+def get_product_with_variants(domain: str, token: str, pid: str | int) -> Optional[dict]:
+    r = requests.get(f"{admin_base(domain)}/products/{pid}.json",
+                     headers=rest_headers(token), timeout=25)
+    if r.status_code == 200:
+        return r.json().get("product")
+    return None
 
 
-def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str], List[str]]:
-    """Returns (hosted_video_urls, external_embed_urls)"""
-    try:
-        r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json", headers=rest_headers(token), timeout=25)
+def _variant_key(v: dict) -> tuple:
+    return (
+        (v.get("option1") or "").strip().lower(),
+        (v.get("option2") or "").strip().lower(),
+        (v.get("option3") or "").strip().lower(),
+        int(v.get("position") or 0),
+    )
+
+
+def find_dst_variant_id_by_options(domain: str, token: str, dst_pid: str | int, src_variant: dict) -> Optional[str]:
+    dst_prod = get_product_with_variants(domain, token, dst_pid)
+    if not dst_prod:
+        return None
+    skey = _variant_key(src_variant)
+    for dv in (dst_prod.get("variants") or []):
+        if _variant_key(dv) == skey:
+            return str(dv.get("id")) if dv.get("id") else None
+    return None
+
+
+def put_variant_fields(domain: str, token: str, variant_id: str | int, *,
+                       sku: Optional[str] = None,
+                       price: Optional[str] = None,
+                       compare_at_price: Optional[str] = None):
+    payload = {"variant": {"id": int(variant_id)}}
+    if sku is not None:
+        payload["variant"]["sku"] = sku
+    if price is not None:
+        payload["variant"]["price"] = price
+    if compare_at_price is not None:
+        payload["variant"]["compare_at_price"] = compare_at_price
+    r = requests.put(f"{admin_base(domain)}/variants/{variant_id}.json",
+                     headers=rest_headers(token), json=payload, timeout=25)
+    if r.status_code not in (200, 201):
+        warn(f"[variant] update failed id={variant_id} on {domain}: {r.status_code} {r.text}")
+
+
+def sync_variant_skus_from_src_to_dst_by_options(src_prod: dict, dst_store: dict, dst_pid: str | int,
+                                                 also_sync_price: bool = False):
+    variants = src_prod.get("variants") or []
+    if not variants:
+        return
+    for sv in variants:
+        sku = (sv.get("sku") or "").strip()
+        dst_vid = find_dst_variant_id_by_options(dst_store["domain"], dst_store["token"], dst_pid, sv)
+        if not dst_vid:
+            continue
+
+        # read current destination variant
+        r = requests.get(f"{admin_base(dst_store['domain'])}/variants/{dst_vid}.json",
+                         headers=rest_headers(dst_store["token"]), timeout=20)
         if r.status_code != 200:
-            return [], []
-        items = r.json().get("media", []) or []
-        hosted, external = [], []
-        for m in items:
-            t = (m.get("media_type") or m.get("type") or "").lower()
-            if t == "video":
-                for s in (m.get("sources") or []):
-                    url = s.get("url")
-                    if url and url.lower().endswith((".mp4", ".mov", ".m4v")):
-                        hosted.append(url)
-                        break
-            elif t in ("external_video", "external-video"):
-                ev = m.get("external_video") or {}
-                if ev.get("embed_url"):
-                    external.append(ev["embed_url"])
-        return hosted, external
-    except Exception:
-        return [], []
+            continue
+        dv = (r.json().get("variant") or {})
+        dst_sku = (dv.get("sku") or "").strip()
 
+        need_sku_update = bool(sku) and (sku != dst_sku)
+        need_price_update = False
 
-def _product_create_media_videos(domain: str, token: str, dst_pid: str | int, video_urls: List[str]):
-    if not video_urls:
-        return
-    product_gid = f"gid://shopify/Product/{dst_pid}"
-    media = [{"alt": "", "originalSource": u, "mediaContentType": "VIDEO"} for u in video_urls]
-    resp = graphql(domain, token, PRODUCT_CREATE_MEDIA, {"productId": product_gid, "media": media})
-    errs = (resp.get("data", {}) or {}).get("productCreateMedia", {}).get("mediaUserErrors", [])
-    if errs:
-        for e in errs:
-            warn(f"[media] productCreateMedia error on {domain}: {e.get('message')} field={e.get('field')}")
+        p = sv.get("price")
+        cap = sv.get("compare_at_price")
+        if also_sync_price:
+            need_price_update = (p is not None and p != dv.get("price")) or \
+                                (cap is not None and cap != dv.get("compare_at_price"))
 
-
-def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: str | int):
-    # Only mirror TAF -> AFL per spec
-    if src_store["name"] != "TAF":
-        return
-    try:
-        hosted, external = _get_media_urls(src_store["domain"], src_store["token"], src_pid)
-        if not hosted and not external:
-            return
-        info(
-            f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
-            f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})"
-        )
-        # wipe destination media first
-        delete_all_media(dst_store["domain"], dst_store["token"], dst_pid)
-        # hosted videos via GraphQL
-        if hosted:
-            _product_create_media_videos(dst_store["domain"], dst_store["token"], dst_pid, hosted)
-        # external videos via REST
-        for u in external[:10]:
-            create_media_external_video(dst_store["domain"], dst_store["token"], dst_pid, u)
-    except Exception as e:
-        warn(f"[media] video sync error: {e}")
+        if need_sku_update or need_price_update:
+            put_variant_fields(dst_store["domain"], dst_store["token"], dst_vid,
+                               sku=sku if need_sku_update else None,
+                               price=p if (also_sync_price and need_price_update) else None,
+                               compare_at_price=cap if (also_sync_price and need_price_update) else None)
 
 
 # =========================================================
 # Core sync handler
 # =========================================================
-def _delete_on_dst_by_skus(dst_store: dict, skus: list[str]):
-    if not skus:
-        return
-    dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], skus)
-    if dst_pid:
-        info(f"[delete] removing PID {dst_pid} from {dst_store['name']}")
-        delete_product(dst_store["domain"], dst_store["token"], dst_pid)
-
-
 def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     pid = payload.get("id")
     if not pid:
@@ -772,11 +783,10 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     try:
         prod = get_product(src_store["domain"], src_store["token"], pid)
 
-        # Deleted case: remove on dst by SKUs
+        # Deleted at source: delete only if cross-link exists; never by SKUs
         if not prod:
-            skus = [v.get("sku") for v in payload.get("variants", []) if v.get("sku")]
-            info(f"[{src_store['name']} ➝ {dst_store['name']}] source deleted, removing on dst (SKUs {skus})")
-            _delete_on_dst_by_skus(dst_store, skus)
+            if not delete_on_dst_by_crosslink(src_store, dst_store, pid):
+                debug(f"[{src_store['name']} ➝ {dst_store['name']}] source deleted but no cross-link; skip delete")
             return
 
         # Ignore our own echoes
@@ -785,27 +795,22 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             debug(f"[{src_store['name']} ➝ {dst_store['name']}] ignoring event (origin={origin}) pid={pid}")
             return
 
-        # Filter: only 'fireplace' products participate; otherwise delete on dst
+        # Filter: only 'fireplace' products participate; otherwise delete by cross-link only
         if not has_fireplace_tag(prod):
-            info(f"[{src_store['name']}] PID {pid} no fireplace tag, removing from {dst_store['name']}")
-            _delete_on_dst_by_skus(dst_store, [v.get("sku") for v in prod.get("variants", []) if v.get("sku")])
+            info(f"[{src_store['name']}] PID {pid} no fireplace tag")
+            if not delete_on_dst_by_crosslink(src_store, dst_store, pid):
+                debug(f"[{src_store['name']}] PID {pid} has no cross-link; skipping delete to avoid SKU collisions")
             return
 
-        # Hard availability rule from TAF: if draft or archived or total <= 0 => ensure absent on AFL
+        # Hard availability rule from TAF: if draft/archived or total <= 0 => ensure absent on AFL (by cross-link)
         if src_store["name"] == "TAF":
             total_avail = product_total_available(
                 src_store["domain"], src_store["token"], prod, src_store.get("location_id")
             )
             if prod.get("status") in ("draft", "archived") or total_avail <= 0:
-                info(
-                    f"[TAF] PID {pid} unavailable (status={prod.get('status')}, avail={total_avail}), removing from AFL"
-                )
-                _delete_on_dst_by_skus(
-                    dst_store,
-                    [v.get("sku") for v in prod.get("variants", []) if v.get("sku")]
-                )
-                # Clear cross-link so a later re-activation can recreate cleanly
-                clear_cross_link_on_src(src_store, pid, dst_store["name"])
+                info(f"[TAF] PID {pid} unavailable (status={prod.get('status')}, avail={total_avail})")
+                if not delete_on_dst_by_crosslink(src_store, dst_store, pid):
+                    debug(f"[TAF] PID {pid} has no cross-link; likely a draft duplicate — skipping delete")
                 return
 
         # Idempotency: skip if content hash matches
@@ -815,7 +820,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             debug(f"[{src_store['name']} ➝ {dst_store['name']}] no changes (hash match), skip PID {pid}")
             return
 
-        # Resolve destination product id (strict order)
+        # Resolve destination product id (strict order; NO SKU fallback)
         dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, pid)
 
         # Validate cross-link. If points to a deleted product, clear it and force create
@@ -824,16 +829,11 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             clear_cross_link_on_src(src_store, pid, dst_store["name"])
             dst_pid = None
 
-        # 2) handle exact match
+        # Handle match
         if not dst_pid and prod.get("handle"):
             dst_pid = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
 
-        # 3) any matching SKU
-        src_skus = [v.get("sku") for v in (prod.get("variants") or []) if v.get("sku")]
-        if not dst_pid and src_skus:
-            dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
-
-        # Build base payload (fields safe to PUT/POST)
+        # Build base payload
         product_payload = {
             "product": {
                 "title": prod.get("title"),
@@ -863,8 +863,13 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 src_store["name"],
             )
             _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
-            # Sync variant prices explicitly by SKU
+
+            # Ensure SKUs exist on AFL even if added later on TAF (match by options)
+            sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
+
+            # Sync variant prices explicitly by SKU (now safe)
             sync_variant_prices_from_src_to_dst(prod, dst_store)
+
             _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
 
         else:
@@ -873,83 +878,62 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 info(f"[{src_store['name']} ➝ {dst_store['name']}] no match; creation disabled for {src_store['name']}. Skip.")
                 return
 
-            # preflight existence checks
-            pre_dst = None
-            if prod.get("handle"):
-                pre_dst = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
-            if not pre_dst and src_skus:
-                pre_dst = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
-
-            if pre_dst:
-                dst_pid = pre_dst
-                info(f"[{src_store['name']} ➝ {dst_store['name']}] switched to update (found preflight PID {dst_pid})")
-                product_payload["product"]["id"] = int(dst_pid)
-                set_mf(
-                    dst_store["domain"],
-                    dst_store["token"],
-                    dst_pid,
-                    ORIGIN_NS,
-                    ORIGIN_KEY,
-                    "single_line_text_field",
-                    src_store["name"],
-                )
-                _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
-                # Also bring prices in sync after updating
-                sync_variant_prices_from_src_to_dst(prod, dst_store)
-                _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
-            else:
-                # CREATE
-                info(f"[{src_store['name']} ➝ {dst_store['name']}] creating new product")
-                product_payload["product"]["variants"] = [
-                    {
-                        "sku": v.get("sku"),
-                        "price": v.get("price"),
-                        "compare_at_price": v.get("compare_at_price"),
-                        "taxable": v.get("taxable", True),
-                        "requires_shipping": v.get("requires_shipping", True),
-                        "barcode": v.get("barcode"),
-                        "option1": v.get("option1"),
-                        "option2": v.get("option2"),
-                        "option3": v.get("option3"),
-                        "inventory_management": "shopify",
-                    }
-                    for v in (prod.get("variants") or [])
-                ]
-                try:
-                    created = _post_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
-                    if created:
-                        dst_pid = str(created["id"])
-                        created_now = True
+            # CREATE
+            info(f"[{src_store['name']} ➝ {dst_store['name']}] creating new product")
+            product_payload["product"]["variants"] = [
+                {
+                    "sku": v.get("sku"),
+                    "price": v.get("price"),
+                    "compare_at_price": v.get("compare_at_price"),
+                    "taxable": v.get("taxable", True),
+                    "requires_shipping": v.get("requires_shipping", True),
+                    "barcode": v.get("barcode"),
+                    "option1": v.get("option1"),
+                    "option2": v.get("option2"),
+                    "option3": v.get("option3"),
+                    "inventory_management": "shopify",
+                }
+                for v in (prod.get("variants") or [])
+            ]
+            try:
+                created = _post_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
+                if created:
+                    dst_pid = str(created["id"])
+                    created_now = True
+                    _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
+            except RuntimeError as e:
+                msg = str(e)
+                if "422" in msg and "handle" in msg and prod.get("handle"):
+                    hp = prod.get("handle")
+                    found = find_product_id_by_handle(dst_store["domain"], dst_store["token"], hp)
+                    if found:
+                        info(f"[recover] handle '{hp}' taken on {dst_store['name']}, switching to update PID {found}")
+                        dst_pid = found
+                        product_payload["product"]["id"] = int(dst_pid)
+                        set_mf(
+                            dst_store["domain"],
+                            dst_store["token"],
+                            dst_pid,
+                            ORIGIN_NS,
+                            ORIGIN_KEY,
+                            "single_line_text_field",
+                            src_store["name"],
+                        )
+                        _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
                         _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
-                except RuntimeError as e:
-                    msg = str(e)
-                    if "422" in msg and "handle" in msg and prod.get("handle"):
-                        hp = prod.get("handle")
-                        found = find_product_id_by_handle(dst_store["domain"], dst_store["token"], hp)
-                        if found:
-                            info(f"[recover] handle '{hp}' taken on {dst_store['name']}, switching to update PID {found}")
-                            dst_pid = found
-                            product_payload["product"]["id"] = int(dst_pid)
-                            set_mf(
-                                dst_store["domain"],
-                                dst_store["token"],
-                                dst_pid,
-                                ORIGIN_NS,
-                                ORIGIN_KEY,
-                                "single_line_text_field",
-                                src_store["name"],
-                            )
-                            _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
-                            sync_variant_prices_from_src_to_dst(prod, dst_store)
-                            _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
-                        else:
-                            raise
                     else:
                         raise
+                else:
+                    raise
 
-        if not dst_pid:
-            warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
-            return
+            if not dst_pid:
+                warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
+                return
+
+            # After create: ensure SKUs are written even if they were blank at creation
+            sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
+            # Prices too (by SKU) once SKUs exist
+            sync_variant_prices_from_src_to_dst(prod, dst_store)
 
         # Media: only TAF -> AFL
         _sync_images(src_store, dst_store, prod, dst_pid)
