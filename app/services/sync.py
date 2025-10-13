@@ -693,6 +693,33 @@ def sync_variant_skus_from_src_to_dst_by_options(src_prod: dict, dst_store: dict
 # =========================================================
 # Media sync helpers (one-way: TAF -> AFL only)
 # =========================================================
+
+# --- ADD: video-only helpers ---
+def list_video_media_only(domain: str, token: str, pid: str | int) -> list[dict]:
+    """Return only media items that are videos (hosted or external)."""
+    r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
+                     headers=rest_headers(token), timeout=25)
+    if r.status_code != 200:
+        return []
+    items = r.json().get("media", []) or []
+    out = []
+    for m in items:
+        t = (m.get("media_type") or m.get("type") or "").lower()
+        if t in ("video", "external_video", "external-video"):
+            out.append(m)
+    return out
+
+def delete_video_media_only(domain: str, token: str, pid: str | int):
+    """Delete only videos from product media; images are left intact."""
+    vids = list_video_media_only(domain, token, pid)
+    for m in vids:
+        mid = m.get("id")
+        if not mid:
+            continue
+        requests.delete(f"{admin_base(domain)}/products/{pid}/media/{mid}.json",
+                        headers=rest_headers(token), timeout=25)
+# --- END ADD video-only helpers ---
+
 def _sync_images(src_store: dict, dst_store: dict, src_prod: dict, dst_pid: str | int):
     if src_store["name"] != "TAF":
         return  # do not sync media from AFL -> TAF
@@ -744,6 +771,17 @@ def _product_create_media_videos(domain: str, token: str, dst_pid: str | int, vi
             warn(f"[media] productCreateMedia error on {domain}: {e.get('message')} field={e.get('field')}")
 
 
+# --- New Helper: _sync_videos with video-only delete + poll ---
+def _poll_video_processing_complete(domain: str, token: str, pid: str | int, timeout_sec: int = 60):
+    """Best-effort: wait a bit for Shopify to process hosted videos so they appear on AFL."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_sec:
+        vids = list_video_media_only(domain, token, pid)
+        # if there are videos and all are READY/FAILED, we can stop
+        if vids and all((m.get("status") or "").lower() in ("ready", "failed") for m in vids):
+            return
+        time.sleep(2)
+
 def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: str | int):
     # Only mirror TAF -> AFL per spec
     if src_store["name"] != "TAF":
@@ -754,17 +792,23 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
             return
         info(f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
              f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
-        # wipe destination media first
-        delete_all_media(dst_store["domain"], dst_store["token"], dst_pid)
-        # hosted videos via GraphQL
+
+        # ❗ Only delete existing videos; keep images intact
+        delete_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
+
+        # hosted videos via GraphQL (asynchronous)
         if hosted:
             _product_create_media_videos(dst_store["domain"], dst_store["token"], dst_pid, hosted)
+
         # external videos via REST
         for u in external[:10]:
             create_media_external_video(dst_store["domain"], dst_store["token"], dst_pid, u)
+
+        # Optional: poll briefly so they show up reliably
+        _poll_video_processing_complete(dst_store["domain"], dst_store["token"], dst_pid, timeout_sec=45)
+
     except Exception as e:
         warn(f"[media] video sync error: {e}")
-
 
 # =========================================================
 # Readiness helpers
