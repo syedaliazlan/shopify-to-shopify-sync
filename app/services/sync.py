@@ -89,6 +89,20 @@ def compute_hash(prod: dict) -> str:
 # =========================================================
 # GraphQL helpers
 # =========================================================
+
+STAGED_UPLOADS_CREATE = """
+mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+  stagedUploadsCreate(input: $input) {
+    stagedTargets {
+      url
+      resourceUrl
+      parameters { name value }
+    }
+    userErrors { field message }
+  }
+}
+"""
+
 FIND_BY_SKU = """
 query($q:String!) {
   productVariants(first: 10, query: $q) {
@@ -694,6 +708,57 @@ def sync_variant_skus_from_src_to_dst_by_options(src_prod: dict, dst_store: dict
 # Media sync helpers (one-way: TAF -> AFL only)
 # =========================================================
 
+def _staged_upload_create_video(domain: str, token: str, filename: str, mime: str = "video/mp4") -> tuple[str, str, list[dict]]:
+    """Ask Shopify for a pre-signed S3 target to upload a video. Returns (post_url, resource_url, params)."""
+    variables = {
+        "input": [{
+            "resource": "VIDEO",
+            "filename": filename,
+            "mimeType": mime,
+            "httpMethod": "POST"
+        }]
+    }
+    resp = graphql(domain, token, STAGED_UPLOADS_CREATE, variables)
+    data = (resp.get("data") or {}).get("stagedUploadsCreate") or {}
+    errs = data.get("userErrors") or []
+    if errs:
+        for e in errs:
+            warn(f"[media] stagedUploadsCreate error on {domain}: {e.get('message')}")
+        raise RuntimeError("stagedUploadsCreate failed")
+    target = (data.get("stagedTargets") or [])[0]
+    return target["url"], target["resourceUrl"], target["parameters"]
+
+def _staged_upload_post(url: str, params: list[dict], file_bytes: bytes):
+    """POST the video bytes to the S3 form target Shopify gave us."""
+    import requests as _rq
+    # Build multipart form: fields first, then the file under 'file'
+    form = {p["name"]: p["value"] for p in params if p.get("name") and p.get("value")}
+    files = {"file": (form.get("key", "upload.mp4"), file_bytes)}
+    r = _rq.post(url, data=form, files=files, timeout=300)
+    if r.status_code not in (204, 201, 200):
+        raise RuntimeError(f"staged upload failed {r.status_code}: {r.text}")
+
+def _download_bytes(url: str) -> tuple[bytes, str]:
+    """Download the source video to memory. Returns (bytes, guess_ext)."""
+    import requests as _rq, mimetypes
+    rr = _rq.get(url, stream=True, timeout=120)
+    rr.raise_for_status()
+    data = rr.content
+    ctype = rr.headers.get("Content-Type", "video/mp4")
+    ext = mimetypes.guess_extension(ctype) or ".mp4"
+    return data, ext
+
+def _create_video_media_from_staged(domain: str, token: str, dst_pid: str | int, resource_url: str):
+    """Attach the staged video to the product via productCreateMedia."""
+    product_gid = f"gid://shopify/Product/{dst_pid}"
+    media = [{"alt": "", "originalSource": resource_url, "mediaContentType": "VIDEO"}]
+    resp = graphql(domain, token, PRODUCT_CREATE_MEDIA, {"productId": product_gid, "media": media})
+    errs = (((resp.get("data") or {}).get("productCreateMedia") or {}).get("mediaUserErrors")) or []
+    if errs:
+        for e in errs:
+            warn(f"[media] productCreateMedia error on {domain}: {e.get('message')} field={e.get('field')}")
+        raise RuntimeError("productCreateMedia error")
+
 # --- ADD: video-only helpers ---
 def list_video_media_only(domain: str, token: str, pid: str | int) -> list[dict]:
     """Return only media items that are videos (hosted or external)."""
@@ -790,22 +855,40 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
         hosted, external = _get_media_urls(src_store["domain"], src_store["token"], src_pid)
         if not hosted and not external:
             return
+
         info(f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
              f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
 
-        # ❗ Only delete existing videos; keep images intact
+        # remove only videos on destination (keep images)
         delete_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
 
-        # hosted videos via GraphQL (asynchronous)
-        if hosted:
-            _product_create_media_videos(dst_store["domain"], dst_store["token"], dst_pid, hosted)
-
-        # external videos via REST
+        # 1) External videos (YouTube/Vimeo) via REST
         for u in external[:10]:
             create_media_external_video(dst_store["domain"], dst_store["token"], dst_pid, u)
 
-        # Optional: poll briefly so they show up reliably
-        _poll_video_processing_complete(dst_store["domain"], dst_store["token"], dst_pid, timeout_sec=45)
+        # 2) Shopify-hosted videos must be re-uploaded to AFL using staged uploads
+        for src_url in hosted[:5]:  # safety cap
+            try:
+                # download from TAF's temp URL
+                data, ext = _download_bytes(src_url)
+                filename = f"taf-copy{ext or '.mp4'}"
+
+                # request staged S3 target on AFL and upload
+                post_url, resource_url, params = _staged_upload_create_video(dst_store["domain"], dst_store["token"], filename)
+                _staged_upload_post(post_url, params, data)
+
+                # attach to product
+                _create_video_media_from_staged(dst_store["domain"], dst_store["token"], dst_pid, resource_url)
+            except Exception as inner:
+                warn(f"[media] hosted video copy failed: {inner}")
+
+        # Best-effort: wait a bit so hosted videos show READY
+        t0 = time.time()
+        while time.time() - t0 < 45:
+            vids = list_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
+            if vids and all((m.get("status") or "").lower() in ("ready", "failed") for m in vids):
+                break
+            time.sleep(2)
 
     except Exception as e:
         warn(f"[media] video sync error: {e}")
