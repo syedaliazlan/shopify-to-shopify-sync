@@ -861,6 +861,7 @@ def _taf_available(src_store: dict, prod: dict) -> bool:
 # =========================================================
 # Core sync handler
 # =========================================================
+
 def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     pid = payload.get("id")
     if not pid:
@@ -882,6 +883,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     try:
         prod = get_product(src_store["domain"], src_store["token"], pid)
         if not prod:
+            # Source deleted → best-effort draft on dst by cross-link
             decide(f"{src_store['name']} pid={pid} deleted on source")
             if not draft_on_dst_by_crosslink(src_store, dst_store, pid):
                 decide("draft-skip: no cross-link on delete")
@@ -893,14 +895,14 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             decide(f"skip: origin marker (origin={origin}) pid={pid}")
             return
 
-        # Fireplace filter
+        # Filter: only 'fireplace' products participate; otherwise draft on dst (no hard delete)
         if not has_fireplace_tag(prod):
             decide(f"draft: missing 'fireplace' tag pid={pid}")
             if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, prod, pid):
-                decide("draft-skip: no cross-link/handle match")
+                decide("draft-skip: no cross-link/handle/SKU match")
             return
 
-        # Availability gate (TAF) → mark but DO NOT return
+        # ---- Availability gate (TAF) — mark, but DO NOT return ----
         force_draft = False
         taf_total_avail = None
         if src_store["name"] == "TAF":
@@ -912,7 +914,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
                 force_draft = True
 
-        # Hash (include media when TAF)
+        # ---- Hash (include media when TAF so video-only edits trigger) ----
         if src_store["name"] == "TAF":
             new_hash = compute_hash_with_media(src_store, prod, pid)
         else:
@@ -923,7 +925,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             decide("skip: hash match")
             return
 
-        # Resolve destination
+        # ---- Resolve destination PID (cross-link → handle → any SKU) ----
         dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, pid)
         decide(f"resolve: cross-link => {dst_pid}")
         if dst_pid and not product_exists(dst_store["domain"], dst_store["token"], dst_pid):
@@ -935,15 +937,13 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             dst_pid = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
             decide(f"resolve: handle '{prod.get('handle')}' => {dst_pid}")
 
-        # 3) any matching SKU (helps legacy pairs with same SKUs but different handles)
         if not dst_pid:
-            src_skus = [ (v.get("sku") or "").strip() for v in (prod.get("variants") or []) if (v.get("sku") or "").strip() ]
-        if src_skus:
-            dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
-            decide(f"resolve: by-any-sku {src_skus} => {dst_pid}")
+            src_skus = [(v.get("sku") or "").strip() for v in (prod.get("variants") or []) if (v.get("sku") or "").strip()]
+            if src_skus:
+                dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
+                decide(f"resolve: by-any-sku {src_skus} => {dst_pid}")
 
-
-        # Build base product payload
+        # ---- Build base payload ----
         product_payload = {
             "product": {
                 "title": prod.get("title"),
@@ -951,35 +951,34 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 "vendor": prod.get("vendor"),
                 "product_type": prod.get("product_type"),
                 "tags": prod.get("tags", ""),
-                "status": prod.get("status", "active"),
+                "status": prod.get("status", "active"),  # field set, but we still explicitly control status below
                 "handle": prod.get("handle"),
             }
         }
         created_now = False
 
         if dst_pid:
-            # UPDATE
+            # =================== UPDATE PATH ===================
             info(f"[{src_store['name']} ➝ {dst_store['name']}] updating PID {dst_pid}")
             product_payload["product"]["id"] = int(dst_pid)
+
+            # mark origin on DST so its echo is muted
             set_mf(dst_store["domain"], dst_store["token"], dst_pid,
                    ORIGIN_NS, ORIGIN_KEY, "single_line_text_field", src_store["name"])
             _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
 
+            # Decide and set status (do not bail out from earlier)
             if src_store["name"] == "TAF":
                 sku_ready = _sku_ready(prod)
-                taf_avail = _taf_available(src_store, prod)
-                decide(f"status-decision(update): sku_ready={sku_ready} taf_available={taf_avail}")
-                if taf_avail and sku_ready:
-                    ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "active")
-                    decide(f"status=active result={ok}")
-                else:
-                    ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "draft")
-                    decide(f"status=draft result={ok}")
+                decide(f"status-decision(update): force_draft={force_draft} sku_ready={sku_ready}")
+                target_status = "draft" if (force_draft or not sku_ready) else "active"
+                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
+                decide(f"status={target_status} result={ok}")
 
-            # Ensure SKUs exist
+            # Ensure SKUs exist on AFL even if added later on TAF (match by options)
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
 
-            # Mirror stock & prices once SKUs exist
+            # Mirror inventory & prices once SKUs exist
             if _sku_ready(prod):
                 mirror_inventory_values_from_src_to_dst(
                     src_store, dst_store, prod, src_store.get("location_id"), dst_store.get("location_id")
@@ -989,7 +988,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
 
         else:
-            # CREATE (TAF only)
+            # =================== CREATE PATH (TAF only) ===================
             if src_store["name"] != "TAF":
                 info(f"[{src_store['name']} ➝ {dst_store['name']}] no match; creation disabled for {src_store['name']}. Skip.")
                 return
@@ -1038,15 +1037,13 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
                 return
 
-            sku_ready = _sku_ready(prod)
-            taf_avail = _taf_available(src_store, prod)
-            decide(f"status-decision(create): sku_ready={sku_ready} taf_available={taf_avail}")
-            if taf_avail and sku_ready:
-                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "active")
-                decide(f"status=active result={ok}")
-            else:
-                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "draft")
-                decide(f"status=draft result={ok}")
+            # Decide and set status after create
+            if src_store["name"] == "TAF":
+                sku_ready = _sku_ready(prod)
+                decide(f"status-decision(create): force_draft={force_draft} sku_ready={sku_ready}")
+                target_status = "draft" if (force_draft or not sku_ready) else "active"
+                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
+                decide(f"status={target_status} result={ok}")
 
             # After create: ensure SKUs are written then mirror
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
@@ -1056,18 +1053,19 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 )
                 sync_variant_prices_from_src_to_dst(prod, dst_store)
 
-        # Media (TAF -> AFL)
+        # ---- Media (TAF -> AFL) ----
         if src_store["name"] == "TAF":
             hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
             decide(f"media: images={len(_norm_images(prod))} hosted_videos={len(hosted)} external_videos={len(external)}")
             _sync_images(src_store, dst_store, prod, dst_pid)
             _sync_videos(src_store, dst_store, pid, dst_pid)
 
-        # Cross-link & finalize
+        # ---- Cross-link & finalize ----
         write_cross_links(src_store, dst_store, pid, dst_pid)
         set_mf(src_store["domain"], src_store["token"], pid, "sync", "last_hash",
                "single_line_text_field", new_hash)
 
+        # clear origin marker on dst so future legit edits propagate
         mfid = get_mf_id(dst_store["domain"], dst_store["token"], dst_pid, ORIGIN_NS, ORIGIN_KEY)
         if mfid:
             delete_mf(dst_store["domain"], dst_store["token"], mfid)
