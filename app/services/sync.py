@@ -300,7 +300,7 @@ def create_media_external_video(domain: str, token: str, pid: str | int, embed_u
 # =========================================================
 def get_cross_link_pid_on_dst(src_store: dict, dst_store: dict, src_pid: str | int) -> Optional[str]:
     key = "afl_product_id" if dst_store["name"] == "AFL" else "taf_product_id"
-    val = get_mf(src_store["domain"], src_store["token'], src_pid, "sync", key)
+    val = get_mf(src_store["domain"], src_store["token"], src_pid, "sync", key)
     if not val:
         return None
     if isinstance(val, str):
