@@ -928,9 +928,18 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             warn(f"[resolve] cross-link {dst_pid} missing on {dst_store['name']}")
             clear_cross_link_on_src(src_store, pid, dst_store["name"])
             dst_pid = None
+            
         if not dst_pid and prod.get("handle"):
             dst_pid = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
             decide(f"resolve: handle '{prod.get('handle')}' => {dst_pid}")
+
+        # 3) any matching SKU (helps legacy pairs with same SKUs but different handles)
+        if not dst_pid:
+            src_skus = [ (v.get("sku") or "").strip() for v in (prod.get("variants") or []) if (v.get("sku") or "").strip() ]
+        if src_skus:
+            dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
+            decide(f"resolve: by-any-sku {src_skus} => {dst_pid}")
+
 
         # Build base product payload
         product_payload = {
