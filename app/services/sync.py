@@ -900,15 +900,17 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 decide("draft-skip: no cross-link/handle match")
             return
 
-        # Availability gate (TAF)
+        # Availability gate (TAF) → mark but DO NOT return
+        force_draft = False
+        taf_total_avail = None
         if src_store["name"] == "TAF":
-            total_avail = product_total_available(src_store["domain"], src_store["token"], prod, src_store.get("location_id"))
-            decide(f"availability: status={prod.get('status')} total_avail={total_avail} pid={pid}")
-            if prod.get("status") in ("draft", "archived") or total_avail <= 0:
-                decide("draft: TAF unavailable (status/stock)")
-                if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, prod, pid):
-                    decide("draft-skip: no cross-link/handle match")
-                return
+            taf_total_avail = product_total_available(
+                src_store["domain"], src_store["token"], prod, src_store.get("location_id")
+            )
+            decide(f"availability: status={prod.get('status')} total_avail={taf_total_avail} pid={pid}")
+            if prod.get("status") in ("draft", "archived") or (taf_total_avail is not None and taf_total_avail <= 0):
+                decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
+                force_draft = True
 
         # Hash (include media when TAF)
         if src_store["name"] == "TAF":
@@ -928,7 +930,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             warn(f"[resolve] cross-link {dst_pid} missing on {dst_store['name']}")
             clear_cross_link_on_src(src_store, pid, dst_store["name"])
             dst_pid = None
-            
+
         if not dst_pid and prod.get("handle"):
             dst_pid = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
             decide(f"resolve: handle '{prod.get('handle')}' => {dst_pid}")
