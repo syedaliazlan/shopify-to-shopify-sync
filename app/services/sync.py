@@ -777,42 +777,152 @@ def delete_video_media_only(domain: str, token: str, pid: str | int):
         requests.delete(f"{admin_base(domain)}/products/{pid}/media/{mid}.json",
                         headers=rest_headers(token), timeout=25)
 
-def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str], List[str]]:
-    """Returns (hosted_video_urls, external_embed_urls)."""
+# def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str], List[str]]:
+#     """Returns (hosted_video_urls, external_embed_urls)."""
+#     try:
+#         r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
+#                          headers=rest_headers(token), timeout=25)
+#         if r.status_code != 200:
+#             return [], []
+#         items = r.json().get("media", []) or []
+#         hosted, external = [], []
+#         for m in items:
+#             t = (m.get("media_type") or m.get("type") or "").lower()
+#             if t == "video":
+#                 sources = [s.get("url") for s in (m.get("sources") or []) if s.get("url")]
+#                 if sources:
+#                     hosted.append(sources[-1])  # take last (often highest quality)
+#             elif t in ("external_video", "external-video"):
+#                 eu = (m.get("external_video", {}).get("embed_url") or "").strip()
+#                 if eu:
+#                     external.append(eu)
+#         return hosted, external
+#     except Exception:
+#         return [], []
+
+# def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
+#     for m in list_media(domain, token, pid) or []:
+#         t = (m.get("media_type") or m.get("type") or "").lower()
+#         if t in ("video", "external_video", "external-video"):
+#             return True
+#     return False
+
+# def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 45, interval_sec: int = 3) -> Tuple[List[str], List[str]]:
+#     hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
+#     if hosted or external:
+#         return hosted, external
+#     if not _any_videos_on_product(src_store["domain"], src_store["token"], pid):
+#         return hosted, external
+#     decide(f"media: videos present but not ready; polling up to {max_wait_sec}s")
+#     t0 = time.time()
+#     while time.time() - t0 < max_wait_sec:
+#         time.sleep(interval_sec)
+#         hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
+#         if hosted or external:
+#             break
+#     return hosted, external
+
+# --- REPLACE: media discovery helpers (use GraphQL, fallback to REST) ---
+
+MEDIA_QUERY = """
+query($id: ID!, $n: Int!) {
+  product(id: $id) {
+    id
+    media(first: $n) {
+      nodes {
+        mediaContentType
+        status
+        ... on Video {
+          sources { url mimeType }
+        }
+        ... on ExternalVideo {
+          embeddedUrl
+        }
+      }
+    }
+  }
+}
+"""
+
+def _get_media_urls_graphql(domain: str, token: str, pid: str | int, first: int = 30) -> Tuple[List[str], List[str], List[str]]:
+    """Return (hosted_video_urls, external_embed_urls, statuses) via GraphQL."""
+    try:
+        gid = f"gid://shopify/Product/{pid}"
+        resp = graphql(domain, token, MEDIA_QUERY, {"id": gid, "n": first})
+        nodes = (((resp.get("data") or {}).get("product") or {}).get("media") or {}).get("nodes") or []
+        hosted, external, statuses = [], [], []
+        for m in nodes:
+            mtype = (m.get("mediaContentType") or "").upper()
+            statuses.append((m.get("status") or "").upper())
+            if mtype == "VIDEO":
+                srcs = m.get("sources") or []
+                for s in srcs:
+                    url = s.get("url")
+                    if url:
+                        hosted.append(url)
+                hosted = list(dict.fromkeys(hosted))  # unique, stable order
+            elif mtype == "EXTERNAL_VIDEO":
+                eu = (m.get("embeddedUrl") or "").strip()
+                if eu:
+                    external.append(eu)
+        return hosted, external, statuses
+    except Exception as e:
+        warn(f"[media] GraphQL read failed: {e}")
+        return [], [], []
+
+def _get_media_urls_rest(domain: str, token: str, pid: str | int) -> Tuple[List[str], List[str], List[str]]:
     try:
         r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
                          headers=rest_headers(token), timeout=25)
         if r.status_code != 200:
-            return [], []
+            return [], [], []
         items = r.json().get("media", []) or []
-        hosted, external = [], []
+        hosted, external, statuses = [], [], []
         for m in items:
             t = (m.get("media_type") or m.get("type") or "").lower()
+            statuses.append((m.get("status") or "").upper())
             if t == "video":
-                sources = [s.get("url") for s in (m.get("sources") or []) if s.get("url")]
-                if sources:
-                    hosted.append(sources[-1])  # take last (often highest quality)
+                for s in (m.get("sources") or []):
+                    u = s.get("url")
+                    if u:
+                        hosted.append(u)
             elif t in ("external_video", "external-video"):
                 eu = (m.get("external_video", {}).get("embed_url") or "").strip()
                 if eu:
                     external.append(eu)
-        return hosted, external
+        return hosted, external, statuses
     except Exception:
-        return [], []
+        return [], [], []
+
+def _get_media_urls(domain: str, token: str, pid: str | int) -> Tuple[List[str], List[str]]:
+    """Primary read via GraphQL, fallback to REST if empty."""
+    hosted, external, statuses = _get_media_urls_graphql(domain, token, pid)
+    if not hosted and not external:
+        hosted, external, statuses = _get_media_urls_rest(domain, token, pid)
+    decide(f"media-read: hosted={len(hosted)} external={len(external)} statuses={statuses}")
+    return hosted, external
 
 def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
-    for m in list_media(domain, token, pid) or []:
-        t = (m.get("media_type") or m.get("type") or "").lower()
-        if t in ("video", "external_video", "external-video"):
-            return True
-    return False
+    # Fast check via GraphQL; if it fails, fallback to REST
+    hosted, external, _ = _get_media_urls_graphql(domain, token, pid)
+    if hosted or external:
+        return True
+    hosted, external, _ = _get_media_urls_rest(domain, token, pid)
+    return bool(hosted or external)
 
-def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 45, interval_sec: int = 3) -> Tuple[List[str], List[str]]:
+def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 60, interval_sec: int = 4) -> Tuple[List[str], List[str]]:
+    """
+    Poll the source for a short period until videos surface via GraphQL/REST.
+    Handles the post-upload processing lag (common for .mov/.mp4).
+    """
     hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
     if hosted or external:
         return hosted, external
+
+    # Only poll if *any* video objects appear to exist
     if not _any_videos_on_product(src_store["domain"], src_store["token"], pid):
         return hosted, external
+
     decide(f"media: videos present but not ready; polling up to {max_wait_sec}s")
     t0 = time.time()
     while time.time() - t0 < max_wait_sec:
@@ -821,6 +931,7 @@ def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: in
         if hosted or external:
             break
     return hosted, external
+# --- END REPLACE ---
 
 def _staged_upload_create_video(domain: str, token: str, filename: str, mime: str = "video/mp4") -> tuple[str, str, list[dict]]:
     variables = {"input": [{"resource": "VIDEO", "filename": filename, "mimeType": mime, "httpMethod": "POST"}]}
