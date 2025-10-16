@@ -12,7 +12,7 @@ from ..clients.shopify import admin_base, rest_headers, graphql
 from ..utils.logger import debug, info, warn, error
 
 # =========================================================
-# Tracing (turn on with SYNC_TRACE=1)
+# Tracing (toggle in Render: SYNC_TRACE=1)
 # =========================================================
 TRACE = os.getenv("SYNC_TRACE", "0") == "1"
 def decide(msg: str):
@@ -23,8 +23,8 @@ def decide(msg: str):
 # Locks, Debounce & Mute
 # =========================================================
 _locks: dict[str, threading.Lock] = {}
-_RECENT: dict[str, float] = {}        # per (store:pid) debounce
-_MUTE_UNTIL: dict[str, float] = {}    # per (store:pid) mute after we write to DST
+_RECENT: dict[str, float] = {}        # per (store:pid)
+_MUTE_UNTIL: dict[str, float] = {}    # per (store:pid)
 
 DEBOUNCE_SEC = 25
 MUTE_SEC = 25
@@ -86,7 +86,7 @@ def compute_hash(prod: dict) -> str:
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 def compute_hash_with_media(store: dict, prod: dict, pid: str | int) -> str:
-    """Like compute_hash but includes a stable fingerprint for videos (media IDs + external embed URLs)."""
+    """Like compute_hash but adds stable video fingerprint (external embed URLs + hosted media IDs)."""
     body = {
         "title": prod.get("title", ""),
         "body_html": prod.get("body_html", ""),
@@ -255,8 +255,7 @@ def list_images(domain: str, token: str, pid: str | int) -> list[dict]:
     return []
 
 def delete_all_images(domain: str, token: str, pid: str | int):
-    images = list_images(domain, token, pid)
-    for img in images:
+    for img in list_images(domain, token, pid):
         iid = img.get("id")
         if not iid:
             continue
@@ -280,8 +279,7 @@ def list_media(domain: str, token: str, pid: str | int) -> list[dict]:
     return []
 
 def delete_all_media(domain: str, token: str, pid: str | int):
-    media = list_media(domain, token, pid)
-    for m in media:
+    for m in list_media(domain, token, pid):
         mid = m.get("id")
         if not mid:
             continue
@@ -326,15 +324,6 @@ def product_exists(domain: str, token: str, pid: str | int) -> bool:
     except Exception:
         return False
 
-def draft_on_dst_by_crosslink(src_store: dict, dst_store: dict, src_pid: str | int) -> bool:
-    dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, src_pid)
-    if not dst_pid:
-        return False
-    if not product_exists(dst_store["domain"], dst_store["token"], dst_pid):
-        return False
-    info(f"[status] setting PID {dst_pid} to draft on {dst_store['name']} (by cross-link)")
-    return _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "draft")
-
 def clear_cross_link_on_src(src_store: dict, src_pid: str | int, dst_store_name: str):
     key = "afl_product_id" if dst_store_name == "AFL" else "taf_product_id"
     mfid = get_mf_id(src_store["domain"], src_store["token"], src_pid, "sync", key)
@@ -342,15 +331,24 @@ def clear_cross_link_on_src(src_store: dict, src_pid: str | int, dst_store_name:
         delete_mf(src_store["domain"], src_store["token"], mfid)
 
 def draft_on_dst_by_handle_or_crosslink(src_store: dict, dst_store: dict, src_prod: dict, src_pid: str | int) -> bool:
+    # cross-link
     dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, src_pid)
     if dst_pid and product_exists(dst_store["domain"], dst_store["token"], dst_pid):
         info(f"[status] drafting {dst_store['name']} PID {dst_pid} (by cross-link)")
         return _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, "draft")
+    # handle
     handle = (src_prod.get("handle") or "").strip()
     if handle:
         found = find_product_id_by_handle(dst_store["domain"], dst_store["token"], handle)
         if found and product_exists(dst_store["domain"], dst_store["token"], found):
             info(f"[status] drafting {dst_store['name']} PID {found} (by handle '{handle}')")
+            return _set_product_status(dst_store["domain"], dst_store["token"], found, "draft")
+    # any SKU
+    skus = [ (v.get("sku") or "").strip() for v in (src_prod.get("variants") or []) if (v.get("sku") or "").strip() ]
+    if skus:
+        found = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], skus)
+        if found and product_exists(dst_store["domain"], dst_store["token"], found):
+            info(f"[status] drafting {dst_store['name']} PID {found} (by SKU match)")
             return _set_product_status(dst_store["domain"], dst_store["token"], found, "draft")
     return False
 
@@ -391,7 +389,7 @@ def _post_product_with_retry(domain: str, token: str, product_payload: dict) -> 
     raise RuntimeError(f"POST product failed {r.status_code}: {r.text}")
 
 # =========================================================
-# Inventory helpers
+# Inventory helpers (with no-op suppression)
 # =========================================================
 def _primary_location_id(domain: str, token: str) -> Optional[str]:
     r = requests.get(f"{admin_base(domain)}/locations.json",
@@ -424,6 +422,17 @@ def _sum_available_for_item(domain: str, token: str, inventory_item_id: int, loc
     levels = r.json().get("inventory_levels", []) or []
     return sum((lvl.get("available") or 0) for lvl in levels)
 
+def _current_available_for_item(domain: str, token: str, inventory_item_id: int, location_id_legacy: Optional[str]) -> Optional[int]:
+    params = {"inventory_item_ids": inventory_item_id}
+    if location_id_legacy:
+        params["location_ids"] = location_id_legacy
+    r = requests.get(f"{admin_base(domain)}/inventory_levels.json",
+                     headers=rest_headers(token), params=params, timeout=20)
+    if r.status_code != 200:
+        return None
+    levels = r.json().get("inventory_levels", []) or []
+    return sum((lvl.get("available") or 0) for lvl in levels)
+
 def product_total_available(domain: str, token: str, prod: dict, enforce_location: Optional[str]) -> int:
     total = 0
     for v in (prod.get("variants") or []):
@@ -440,6 +449,22 @@ def _connect_level_if_needed(domain: str, token: str, inventory_item_id: int, lo
     payload = {"inventory_item_id": int(inventory_item_id), "location_id": int(location_id_legacy)}
     requests.post(f"{admin_base(domain)}/inventory_levels/connect.json",
                   headers=rest_headers(token), json=payload, timeout=20)
+
+# in-memory suppression of identical sets
+_INVENTORY_SET_CACHE: dict[tuple[str, str], tuple[int, float]] = {}
+_INVENTORY_SET_TTL = 30
+
+def _recently_set_same_qty(domain: str, sku: str, qty: int) -> bool:
+    key = (domain, sku)
+    now = time.time()
+    # gc
+    for k, (q, ts) in list(_INVENTORY_SET_CACHE.items()):
+        if now - ts > _INVENTORY_SET_TTL:
+            _INVENTORY_SET_CACHE.pop(k, None)
+    if key in _INVENTORY_SET_CACHE and _INVENTORY_SET_CACHE[key][0] == int(qty) and (now - _INVENTORY_SET_CACHE[key][1]) < _INVENTORY_SET_TTL:
+        return True
+    _INVENTORY_SET_CACHE[key] = (int(qty), now)
+    return False
 
 def ensure_tracking_enabled_on_product(domain: str, token: str, pid: str | int):
     r = requests.get(f"{admin_base(domain)}/products/{pid}.json",
@@ -469,13 +494,25 @@ def set_absolute_inventory_by_sku(domain: str, token: str, sku: str, qty: int, l
                      headers=rest_headers(token), timeout=20)
     if r.status_code != 200:
         return
-    inventory_item_id = (r.json().get("variant") or {}).get("inventory_item_id")
+    variant = (r.json().get("variant") or {})
+    inventory_item_id = variant.get("inventory_item_id")
     if not inventory_item_id:
         return
+
     if not location_id_legacy:
         location_id_legacy = _primary_location_id(domain, token)
     if not location_id_legacy:
         return
+
+    # Skip if equal (no-op) and suppress recent identical sets
+    current = _current_available_for_item(domain, token, inventory_item_id, location_id_legacy)
+    if current is not None and int(current) == int(qty):
+        debug(f"[inventory] noop set skipped for {sku} on {domain}: {current} == {qty}")
+        return
+    if _recently_set_same_qty(domain, sku, qty):
+        debug(f"[inventory] recent identical set suppressed for {sku} on {domain}: {qty}")
+        return
+
     _connect_level_if_needed(domain, token, inventory_item_id, location_id_legacy)
     payload = {"location_id": int(location_id_legacy),
                "inventory_item_id": int(inventory_item_id),
@@ -557,7 +594,7 @@ def mirror_inventory_values_from_src_to_dst(
         set_absolute_inventory_by_sku(dst_store["domain"], dst_store["token"], sku, available, dst_location_legacy)
 
 # =========================================================
-# Price sync helpers (with throttle)
+# Price sync helpers (with throttle/retry)
 # =========================================================
 _last_call_ts = {"AFL": 0.0, "TAF": 0.0}
 
@@ -608,7 +645,7 @@ def sync_variant_prices_from_src_to_dst(src_prod: dict, dst_store: dict):
         )
 
 # =========================================================
-# SKU late-add helpers (match by options/position)
+# SKU late-add helpers
 # =========================================================
 def get_product_with_variants(domain: str, token: str, pid: str | int) -> Optional[dict]:
     r = requests.get(f"{admin_base(domain)}/products/{pid}.json",
@@ -683,7 +720,7 @@ def sync_variant_skus_from_src_to_dst_by_options(src_prod: dict, dst_store: dict
                                compare_at_price=cap if (also_sync_price and need_price_update) else None)
 
 # =========================================================
-# Media sync (TAF -> AFL)
+# Media sync (TAF -> AFL) with polling for videos
 # =========================================================
 def _list_image_urls(domain: str, token: str, pid: str | int) -> list[str]:
     imgs = list_images(domain, token, pid) or []
@@ -741,7 +778,7 @@ def delete_video_media_only(domain: str, token: str, pid: str | int):
                         headers=rest_headers(token), timeout=25)
 
 def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str], List[str]]:
-    """Returns (hosted_video_urls, external_embed_urls). No file-extension checks."""
+    """Returns (hosted_video_urls, external_embed_urls)."""
     try:
         r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
                          headers=rest_headers(token), timeout=25)
@@ -754,7 +791,7 @@ def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str],
             if t == "video":
                 sources = [s.get("url") for s in (m.get("sources") or []) if s.get("url")]
                 if sources:
-                    hosted.append(sources[-1])  # pick the last (often highest quality)
+                    hosted.append(sources[-1])  # take last (often highest quality)
             elif t in ("external_video", "external-video"):
                 eu = (m.get("external_video", {}).get("embed_url") or "").strip()
                 if eu:
@@ -763,15 +800,30 @@ def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str],
     except Exception:
         return [], []
 
+def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
+    for m in list_media(domain, token, pid) or []:
+        t = (m.get("media_type") or m.get("type") or "").lower()
+        if t in ("video", "external_video", "external-video"):
+            return True
+    return False
+
+def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 45, interval_sec: int = 3) -> Tuple[List[str], List[str]]:
+    hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
+    if hosted or external:
+        return hosted, external
+    if not _any_videos_on_product(src_store["domain"], src_store["token"], pid):
+        return hosted, external
+    decide(f"media: videos present but not ready; polling up to {max_wait_sec}s")
+    t0 = time.time()
+    while time.time() - t0 < max_wait_sec:
+        time.sleep(interval_sec)
+        hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
+        if hosted or external:
+            break
+    return hosted, external
+
 def _staged_upload_create_video(domain: str, token: str, filename: str, mime: str = "video/mp4") -> tuple[str, str, list[dict]]:
-    variables = {
-        "input": [{
-            "resource": "VIDEO",
-            "filename": filename,
-            "mimeType": mime,
-            "httpMethod": "POST"
-        }]
-    }
+    variables = {"input": [{"resource": "VIDEO", "filename": filename, "mimeType": mime, "httpMethod": "POST"}]}
     resp = graphql(domain, token, STAGED_UPLOADS_CREATE, variables)
     data = (resp.get("data") or {}).get("stagedUploadsCreate") or {}
     errs = data.get("userErrors") or []
@@ -813,13 +865,13 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
     if src_store["name"] != "TAF":
         return
     try:
-        hosted, external = _get_media_urls(src_store["domain"], src_store["token"], src_pid)
+        hosted, external = _wait_for_videos_on_source(src_store, src_pid, max_wait_sec=45, interval_sec=3)
         if not hosted and not external:
             return
         info(f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
              f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
 
-        # only delete existing videos; keep images intact
+        # only delete videos; keep images intact
         delete_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
 
         # external videos via REST
@@ -854,14 +906,9 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
 def _sku_ready(prod: dict) -> bool:
     return any((v.get("sku") or "").strip() for v in (prod.get("variants") or []))
 
-def _taf_available(src_store: dict, prod: dict) -> bool:
-    total = product_total_available(src_store["domain"], src_store["token"], prod, src_store.get("location_id"))
-    return prod.get("status") == "active" and total > 0
-
 # =========================================================
 # Core sync handler
 # =========================================================
-
 def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     pid = payload.get("id")
     if not pid:
@@ -883,10 +930,9 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
     try:
         prod = get_product(src_store["domain"], src_store["token"], pid)
         if not prod:
-            # Source deleted → best-effort draft on dst by cross-link
             decide(f"{src_store['name']} pid={pid} deleted on source")
-            if not draft_on_dst_by_crosslink(src_store, dst_store, pid):
-                decide("draft-skip: no cross-link on delete")
+            if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, {"handle": payload.get("handle", "")}, pid):
+                decide("draft-skip: no match on delete")
             return
 
         # Ignore our own echoes
@@ -895,55 +941,51 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             decide(f"skip: origin marker (origin={origin}) pid={pid}")
             return
 
-        # Filter: only 'fireplace' products participate; otherwise draft on dst (no hard delete)
+        # Hard gate: only TAF drives product content/inventory mirroring
+        if src_store["name"] == "AFL":
+            decide("skip: AFL→TAF product content ignored (TAF is source of truth)")
+            return
+
+        # Filter: only 'fireplace' products participate; otherwise draft on dst
         if not has_fireplace_tag(prod):
             decide(f"draft: missing 'fireplace' tag pid={pid}")
             if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, prod, pid):
                 decide("draft-skip: no cross-link/handle/SKU match")
             return
 
-        # ---- Availability gate (TAF) — mark, but DO NOT return ----
+        # Availability (mark, don't return)
         force_draft = False
-        taf_total_avail = None
-        if src_store["name"] == "TAF":
-            taf_total_avail = product_total_available(
-                src_store["domain"], src_store["token"], prod, src_store.get("location_id")
-            )
-            decide(f"availability: status={prod.get('status')} total_avail={taf_total_avail} pid={pid}")
-            if prod.get("status") in ("draft", "archived") or (taf_total_avail is not None and taf_total_avail <= 0):
-                decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
-                force_draft = True
+        taf_total_avail = product_total_available(src_store["domain"], src_store["token"], prod, src_store.get("location_id"))
+        decide(f"availability: status={prod.get('status')} total_avail={taf_total_avail} pid={pid}")
+        if prod.get("status") in ("draft", "archived") or taf_total_avail <= 0:
+            decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
+            force_draft = True
 
-        # ---- Hash (include media when TAF so video-only edits trigger) ----
-        if src_store["name"] == "TAF":
-            new_hash = compute_hash_with_media(src_store, prod, pid)
-        else:
-            new_hash = compute_hash(prod)
+        # Hash (include media on TAF)
+        new_hash = compute_hash_with_media(src_store, prod, pid)
         last_hash = get_mf(src_store["domain"], src_store["token"], pid, "sync", "last_hash")
         decide(f"hash: last={str(last_hash)[:8] if last_hash else None} new={new_hash[:8]}")
         if last_hash and last_hash == new_hash:
             decide("skip: hash match")
             return
 
-        # ---- Resolve destination PID (cross-link → handle → any SKU) ----
+        # Resolve destination: cross-link -> handle -> any SKU
         dst_pid = get_cross_link_pid_on_dst(src_store, dst_store, pid)
         decide(f"resolve: cross-link => {dst_pid}")
         if dst_pid and not product_exists(dst_store["domain"], dst_store["token"], dst_pid):
             warn(f"[resolve] cross-link {dst_pid} missing on {dst_store['name']}")
             clear_cross_link_on_src(src_store, pid, dst_store["name"])
             dst_pid = None
-
         if not dst_pid and prod.get("handle"):
             dst_pid = find_product_id_by_handle(dst_store["domain"], dst_store["token"], prod.get("handle"))
             decide(f"resolve: handle '{prod.get('handle')}' => {dst_pid}")
-
         if not dst_pid:
-            src_skus = [(v.get("sku") or "").strip() for v in (prod.get("variants") or []) if (v.get("sku") or "").strip()]
-            if src_skus:
-                dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], src_skus)
-                decide(f"resolve: by-any-sku {src_skus} => {dst_pid}")
+            skus = [(v.get("sku") or "").strip() for v in (prod.get("variants") or []) if (v.get("sku") or "").strip()]
+            if skus:
+                dst_pid = find_product_id_by_any_sku(dst_store["domain"], dst_store["token"], skus)
+                decide(f"resolve: by-any-sku {skus} => {dst_pid}")
 
-        # ---- Build base payload ----
+        # Base payload
         product_payload = {
             "product": {
                 "title": prod.get("title"),
@@ -951,34 +993,29 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 "vendor": prod.get("vendor"),
                 "product_type": prod.get("product_type"),
                 "tags": prod.get("tags", ""),
-                "status": prod.get("status", "active"),  # field set, but we still explicitly control status below
+                "status": prod.get("status", "active"),
                 "handle": prod.get("handle"),
             }
         }
         created_now = False
 
         if dst_pid:
-            # =================== UPDATE PATH ===================
+            # UPDATE
             info(f"[{src_store['name']} ➝ {dst_store['name']}] updating PID {dst_pid}")
             product_payload["product"]["id"] = int(dst_pid)
-
-            # mark origin on DST so its echo is muted
             set_mf(dst_store["domain"], dst_store["token"], dst_pid,
                    ORIGIN_NS, ORIGIN_KEY, "single_line_text_field", src_store["name"])
             _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
 
-            # Decide and set status (do not bail out from earlier)
-            if src_store["name"] == "TAF":
-                sku_ready = _sku_ready(prod)
-                decide(f"status-decision(update): force_draft={force_draft} sku_ready={sku_ready}")
-                target_status = "draft" if (force_draft or not sku_ready) else "active"
-                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
-                decide(f"status={target_status} result={ok}")
+            # Status decision (don't bail)
+            sku_ready = _sku_ready(prod)
+            decide(f"status-decision(update): force_draft={force_draft} sku_ready={sku_ready}")
+            target_status = "draft" if (force_draft or not sku_ready) else "active"
+            ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
+            decide(f"status={target_status} result={ok}")
 
-            # Ensure SKUs exist on AFL even if added later on TAF (match by options)
+            # Ensure SKUs, then mirror inventory & prices (TAF -> AFL only)
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
-
-            # Mirror inventory & prices once SKUs exist
             if _sku_ready(prod):
                 mirror_inventory_values_from_src_to_dst(
                     src_store, dst_store, prod, src_store.get("location_id"), dst_store.get("location_id")
@@ -988,11 +1025,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
 
         else:
-            # =================== CREATE PATH (TAF only) ===================
-            if src_store["name"] != "TAF":
-                info(f"[{src_store['name']} ➝ {dst_store['name']}] no match; creation disabled for {src_store['name']}. Skip.")
-                return
-
+            # CREATE (TAF only)
             info(f"[{src_store['name']} ➝ {dst_store['name']}] creating new product")
             product_payload["product"]["variants"] = [
                 {
@@ -1037,15 +1070,13 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
                 return
 
-            # Decide and set status after create
-            if src_store["name"] == "TAF":
-                sku_ready = _sku_ready(prod)
-                decide(f"status-decision(create): force_draft={force_draft} sku_ready={sku_ready}")
-                target_status = "draft" if (force_draft or not sku_ready) else "active"
-                ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
-                decide(f"status={target_status} result={ok}")
+            sku_ready = _sku_ready(prod)
+            decide(f"status-decision(create): force_draft={force_draft} sku_ready={sku_ready}")
+            target_status = "draft" if (force_draft or not sku_ready) else "active"
+            ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
+            decide(f"status={target_status} result={ok}")
 
-            # After create: ensure SKUs are written then mirror
+            # Ensure SKUs then mirror inventory & prices (TAF -> AFL)
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
             if _sku_ready(prod):
                 mirror_inventory_values_from_src_to_dst(
@@ -1053,19 +1084,17 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 )
                 sync_variant_prices_from_src_to_dst(prod, dst_store)
 
-        # ---- Media (TAF -> AFL) ----
-        if src_store["name"] == "TAF":
-            hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
-            decide(f"media: images={len(_norm_images(prod))} hosted_videos={len(hosted)} external_videos={len(external)}")
-            _sync_images(src_store, dst_store, prod, dst_pid)
-            _sync_videos(src_store, dst_store, pid, dst_pid)
+        # Media (TAF -> AFL)
+        hosted, external = _wait_for_videos_on_source(src_store, pid, max_wait_sec=45, interval_sec=3)
+        decide(f"media: images={len(_norm_images(prod))} hosted_videos={len(hosted)} external_videos={len(external)}")
+        _sync_images(src_store, dst_store, prod, dst_pid)
+        _sync_videos(src_store, dst_store, pid, dst_pid)
 
-        # ---- Cross-link & finalize ----
+        # Cross-link & finalize
         write_cross_links(src_store, dst_store, pid, dst_pid)
         set_mf(src_store["domain"], src_store["token"], pid, "sync", "last_hash",
-               "single_line_text_field", new_hash)
+               "single_line_text_field", compute_hash_with_media(src_store, prod, pid))
 
-        # clear origin marker on dst so future legit edits propagate
         mfid = get_mf_id(dst_store["domain"], dst_store["token"], dst_pid, ORIGIN_NS, ORIGIN_KEY)
         if mfid:
             delete_mf(dst_store["domain"], dst_store["token"], mfid)
