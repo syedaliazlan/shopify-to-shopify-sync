@@ -165,6 +165,26 @@ mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
 }
 """
 
+MEDIA_QUERY = """
+query($id: ID!, $n: Int!) {
+  product(id: $id) {
+    id
+    media(first: $n) {
+      nodes {
+        mediaContentType
+        status
+        ... on Video {
+          sources { url mimeType }
+        }
+        ... on ExternalVideo {
+          embeddedUrl
+        }
+      }
+    }
+  }
+}
+"""
+
 def find_variant_by_sku(domain: str, token: str, sku: str):
     if not sku:
         return None, None
@@ -243,6 +263,7 @@ def _set_product_status(domain: str, token: str, pid: str | int, status: str) ->
     r = requests.put(f"{admin_base(domain)}/products/{pid}.json",
                      headers=rest_headers(token), json=payload, timeout=25)
     if r.status_code in (200, 201):
+        info(f"[status] set {domain} PID {pid} -> {status}")
         return True
     warn(f"[status] failed setting {pid} to {status} on {domain}: {r.status_code} {r.text}")
     return False
@@ -737,6 +758,7 @@ def _src_images_with_alt(prod: dict) -> list[tuple[str, str]]:
     return out
 
 def _sync_images(src_store: dict, dst_store: dict, src_prod: dict, dst_pid: str | int):
+    # images only flow TAF -> AFL
     if src_store["name"] != "TAF":
         return
     src_imgs = _src_images_with_alt(src_prod)
@@ -777,73 +799,6 @@ def delete_video_media_only(domain: str, token: str, pid: str | int):
         requests.delete(f"{admin_base(domain)}/products/{pid}/media/{mid}.json",
                         headers=rest_headers(token), timeout=25)
 
-# def _get_media_urls(domain: str, token: str, pid: int | str) -> Tuple[List[str], List[str]]:
-#     """Returns (hosted_video_urls, external_embed_urls)."""
-#     try:
-#         r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
-#                          headers=rest_headers(token), timeout=25)
-#         if r.status_code != 200:
-#             return [], []
-#         items = r.json().get("media", []) or []
-#         hosted, external = [], []
-#         for m in items:
-#             t = (m.get("media_type") or m.get("type") or "").lower()
-#             if t == "video":
-#                 sources = [s.get("url") for s in (m.get("sources") or []) if s.get("url")]
-#                 if sources:
-#                     hosted.append(sources[-1])  # take last (often highest quality)
-#             elif t in ("external_video", "external-video"):
-#                 eu = (m.get("external_video", {}).get("embed_url") or "").strip()
-#                 if eu:
-#                     external.append(eu)
-#         return hosted, external
-#     except Exception:
-#         return [], []
-
-# def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
-#     for m in list_media(domain, token, pid) or []:
-#         t = (m.get("media_type") or m.get("type") or "").lower()
-#         if t in ("video", "external_video", "external-video"):
-#             return True
-#     return False
-
-# def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 45, interval_sec: int = 3) -> Tuple[List[str], List[str]]:
-#     hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
-#     if hosted or external:
-#         return hosted, external
-#     if not _any_videos_on_product(src_store["domain"], src_store["token"], pid):
-#         return hosted, external
-#     decide(f"media: videos present but not ready; polling up to {max_wait_sec}s")
-#     t0 = time.time()
-#     while time.time() - t0 < max_wait_sec:
-#         time.sleep(interval_sec)
-#         hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
-#         if hosted or external:
-#             break
-#     return hosted, external
-
-# --- REPLACE: media discovery helpers (use GraphQL, fallback to REST) ---
-
-MEDIA_QUERY = """
-query($id: ID!, $n: Int!) {
-  product(id: $id) {
-    id
-    media(first: $n) {
-      nodes {
-        mediaContentType
-        status
-        ... on Video {
-          sources { url mimeType }
-        }
-        ... on ExternalVideo {
-          embeddedUrl
-        }
-      }
-    }
-  }
-}
-"""
-
 def _get_media_urls_graphql(domain: str, token: str, pid: str | int, first: int = 30) -> Tuple[List[str], List[str], List[str]]:
     """Return (hosted_video_urls, external_embed_urls, statuses) via GraphQL."""
     try:
@@ -860,7 +815,7 @@ def _get_media_urls_graphql(domain: str, token: str, pid: str | int, first: int 
                     url = s.get("url")
                     if url:
                         hosted.append(url)
-                hosted = list(dict.fromkeys(hosted))  # unique, stable order
+                hosted = list(dict.fromkeys(hosted))  # unique
             elif mtype == "EXTERNAL_VIDEO":
                 eu = (m.get("embeddedUrl") or "").strip()
                 if eu:
@@ -903,7 +858,6 @@ def _get_media_urls(domain: str, token: str, pid: str | int) -> Tuple[List[str],
     return hosted, external
 
 def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
-    # Fast check via GraphQL; if it fails, fallback to REST
     hosted, external, _ = _get_media_urls_graphql(domain, token, pid)
     if hosted or external:
         return True
@@ -911,18 +865,12 @@ def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
     return bool(hosted or external)
 
 def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 60, interval_sec: int = 4) -> Tuple[List[str], List[str]]:
-    """
-    Poll the source for a short period until videos surface via GraphQL/REST.
-    Handles the post-upload processing lag (common for .mov/.mp4).
-    """
+    """Poll the source for a short period until videos surface (handles .mov/.mp4 processing lag)."""
     hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
     if hosted or external:
         return hosted, external
-
-    # Only poll if *any* video objects appear to exist
     if not _any_videos_on_product(src_store["domain"], src_store["token"], pid):
         return hosted, external
-
     decide(f"media: videos present but not ready; polling up to {max_wait_sec}s")
     t0 = time.time()
     while time.time() - t0 < max_wait_sec:
@@ -931,27 +879,16 @@ def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: in
         if hosted or external:
             break
     return hosted, external
-# --- END REPLACE ---
 
-def _staged_upload_create_video(
-    domain: str,
-    token: str,
-    filename: str,
-    file_size: int,
-    mime: str = "video/mp4",
-) -> tuple[str, str, list[dict]]:
-    """
-    Request a staged upload target for a VIDEO.
-    Shopify requires fileSize for VIDEO resources.
-    Returns (post_url, resource_url, parameters).
-    """
+def _staged_upload_create_video(domain: str, token: str, filename: str, file_size: int, mime: str = "video/mp4") -> tuple[str, str, list[dict]]:
+    """Request a staged upload target for a VIDEO. fileSize is REQUIRED."""
     variables = {
         "input": [
             {
                 "resource": "VIDEO",
                 "filename": filename,
                 "mimeType": mime,
-                "fileSize": int(file_size),  # REQUIRED for VIDEO
+                "fileSize": int(file_size),
                 "httpMethod": "POST",
             }
         ]
@@ -974,10 +911,7 @@ def _staged_upload_post(url: str, params: list[dict], file_bytes: bytes):
         raise RuntimeError(f"staged upload failed {r.status_code}: {r.text}")
 
 def _download_bytes(url: str) -> tuple[bytes, str, str]:
-    """
-    Download the source video bytes.
-    Returns (data, ext, mime).
-    """
+    """Download source video bytes. Returns (data, ext, mime)."""
     rr = requests.get(url, stream=True, timeout=120)
     rr.raise_for_status()
     data = rr.content
@@ -985,7 +919,6 @@ def _download_bytes(url: str) -> tuple[bytes, str, str]:
     import mimetypes
     ext = mimetypes.guess_extension(mime) or ".mp4"
     return data, ext, mime
-
 
 def _product_create_media_videos(domain: str, token: str, dst_pid: str | int, video_urls: List[str]):
     if not video_urls:
@@ -999,22 +932,11 @@ def _product_create_media_videos(domain: str, token: str, dst_pid: str | int, vi
             warn(f"[media] productCreateMedia error on {domain}: {e.get('message')} field={e.get('field')}")
 
 def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: str | int):
-    """
-    Mirror videos from TAF -> AFL.
-    - Waits briefly for videos to appear on TAF (GraphQL read handles .mp4/.mov).
-    - Deletes only video media on AFL (keeps images intact).
-    - Attaches external videos via REST.
-    - Re-uploads hosted videos via staged uploads (requires fileSize + mime).
-    - Optionally polls until videos are READY on AFL.
-    """
-    # Only mirror TAF -> AFL
+    """Mirror videos from TAF -> AFL (external via REST, hosted via staged upload)."""
     if src_store["name"] != "TAF":
         return
-
     try:
-        # Discover (with short poll for post-upload processing lag)
         hosted, external = _wait_for_videos_on_source(src_store, src_pid, max_wait_sec=60, interval_sec=4)
-
         if not hosted and not external:
             decide("media: no videos to sync (0 hosted, 0 external)")
             return
@@ -1022,41 +944,30 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
         info(f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
              f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
 
-        # Remove only videos on destination; leave images untouched
+        # wipe only videos on destination
         delete_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
 
-        # 1) External videos (YouTube/Vimeo/etc.) via REST
+        # external videos
         for u in external[:10]:
             try:
                 create_media_external_video(dst_store["domain"], dst_store["token"], dst_pid, u)
             except Exception as ex:
                 warn(f"[media] external video attach failed on {dst_store['domain']} url={u}: {ex}")
 
-        # 2) Hosted videos via staged uploads (download from TAF, upload to AFL Files, then attach)
-        #    Shopify recommends unique-ish filenames; include a counter.
+        # hosted videos via staged uploads
         for idx, src_url in enumerate(hosted[:8], start=1):
             try:
                 data, ext, mime = _download_bytes(src_url)
                 filename = f"taf-video-{int(time.time())}-{idx}{ext or '.mp4'}"
-
                 post_url, resource_url, params = _staged_upload_create_video(
-                    dst_store["domain"],
-                    dst_store["token"],
-                    filename=filename,
-                    file_size=len(data),  # REQUIRED for VIDEO
-                    mime=mime,            # match source content-type
+                    dst_store["domain"], dst_store["token"], filename=filename, file_size=len(data), mime=mime
                 )
-
                 _staged_upload_post(post_url, params, data)
-
-                # Attach to product
-                _product_create_media_videos(
-                    dst_store["domain"], dst_store["token"], dst_pid, [resource_url]
-                )
+                _product_create_media_videos(dst_store["domain"], dst_store["token"], dst_pid, [resource_url])
             except Exception as inner:
                 warn(f"[media] hosted video copy failed on {dst_store['domain']} src={src_url}: {inner}")
 
-        # Optional: brief poll so new videos show READY on AFL
+        # brief poll so statuses settle
         t0 = time.time()
         while time.time() - t0 < 45:
             vids = list_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
@@ -1064,7 +975,6 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
                 time.sleep(2)
                 continue
             statuses = [(m.get("status") or "").upper() for m in vids]
-            # stop when all are READY/FAILED (DONE states)
             if all(s in ("READY", "FAILED") for s in statuses):
                 decide(f"media: destination video statuses={statuses}")
                 break
@@ -1126,13 +1036,13 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 decide("draft-skip: no cross-link/handle/SKU match")
             return
 
-        # Availability (mark, don't return)
+        # Availability (draft instead of delete)
         force_draft = False
         taf_total_avail = product_total_available(src_store["domain"], src_store["token"], prod, src_store.get("location_id"))
         decide(f"availability: status={prod.get('status')} total_avail={taf_total_avail} pid={pid}")
         if prod.get("status") in ("draft", "archived") or taf_total_avail <= 0:
-            decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
             force_draft = True
+            decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
 
         # Hash (include media on TAF)
         new_hash = compute_hash_with_media(src_store, prod, pid)
@@ -1172,6 +1082,11 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
         }
         created_now = False
 
+        # If TAF is unavailable AND no counterpart exists yet, *skip creating* until it becomes available/SKU-ready
+        if not dst_pid and force_draft and not _sku_ready(prod):
+            decide("create-skip: TAF is draft/0 stock and no SKU yet; will create on next active/SKU-ready change")
+            return
+
         if dst_pid:
             # UPDATE
             info(f"[{src_store['name']} ➝ {dst_store['name']}] updating PID {dst_pid}")
@@ -1180,7 +1095,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                    ORIGIN_NS, ORIGIN_KEY, "single_line_text_field", src_store["name"])
             _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
 
-            # Status decision (don't bail)
+            # Status decision (draft if force_draft or no SKU; otherwise active)
             sku_ready = _sku_ready(prod)
             decide(f"status-decision(update): force_draft={force_draft} sku_ready={sku_ready}")
             target_status = "draft" if (force_draft or not sku_ready) else "active"
@@ -1243,6 +1158,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
                 return
 
+            # Status decision on create
             sku_ready = _sku_ready(prod)
             decide(f"status-decision(create): force_draft={force_draft} sku_ready={sku_ready}")
             target_status = "draft" if (force_draft or not sku_ready) else "active"
@@ -1268,6 +1184,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
         set_mf(src_store["domain"], src_store["token"], pid, "sync", "last_hash",
                "single_line_text_field", compute_hash_with_media(src_store, prod, pid))
 
+        # clear echo marker on dst
         mfid = get_mf_id(dst_store["domain"], dst_store["token"], dst_pid, ORIGIN_NS, ORIGIN_KEY)
         if mfid:
             delete_mf(dst_store["domain"], dst_store["token"], mfid)
