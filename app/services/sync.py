@@ -216,6 +216,16 @@ def find_product_id_by_handle(domain: str, token: str, handle: str) -> Optional[
 # =========================================================
 # REST helpers (products, variants, metafields)
 # =========================================================
+
+# Retry on duplication of get_product
+def get_product_with_retry(domain: str, token: str, pid: int | str, attempts: int = 4, delay: float = 0.8) -> Optional[dict]:
+    for i in range(attempts):
+        p = get_product(domain, token, pid)
+        if p:
+            return p
+        time.sleep(delay)
+    return None
+
 def get_product(domain: str, token: str, pid: int | str) -> Optional[dict]:
     r = requests.get(f"{admin_base(domain)}/products/{pid}.json",
                      headers=rest_headers(token), timeout=25)
@@ -1011,18 +1021,30 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
 
     decide(f"{src_store['name']}→{dst_store['name']} pid={pid} webhook start")
     try:
-        prod = get_product(src_store["domain"], src_store["token"], pid)
+        prod = get_product_with_retry(src_store["domain"], src_store["token"], pid)
         if not prod:
             decide(f"{src_store['name']} pid={pid} deleted on source")
             if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, {"handle": payload.get("handle", "")}, pid):
                 decide("draft-skip: no match on delete")
             return
-
-        # Ignore our own echoes
+        
+        # Echo suppression: only trust origin on AFL→TAF webhooks.
+        # Old builds may have left origin on TAF; ignore & clean it.
         origin = get_mf(src_store["domain"], src_store["token"], pid, ORIGIN_NS, ORIGIN_KEY)
-        if origin and origin == dst_store["name"]:
-            decide(f"skip: origin marker (origin={origin}) pid={pid}")
-            return
+
+        if src_store["name"] == "AFL":
+            # we set origin='TAF' on AFL right before PUT/POST to AFL, so when AFL fires back,
+            # origin will equal dst_store ('TAF') and we safely skip.
+            if origin and origin == dst_store["name"]:
+                decide(f"skip: origin marker (origin={origin}) pid={pid}")
+                return
+        else:
+            # src_store is TAF — origin should not live here; if it does, purge it so it never blocks sync.
+            if origin in ("AFL", "TAF"):
+                mfid = get_mf_id(src_store["domain"], src_store["token"], pid, ORIGIN_NS, ORIGIN_KEY)
+                if mfid:
+                    delete_mf(src_store["domain"], src_store["token"], mfid)
+                decide(f"ignored & cleared stale origin on {src_store['name']}: {origin}")
 
         # Hard gate: only TAF drives product content/inventory mirroring
         if src_store["name"] == "AFL":
