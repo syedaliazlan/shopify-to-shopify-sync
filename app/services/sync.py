@@ -20,6 +20,20 @@ def decide(msg: str):
         info(f"[decide] {msg}")
 
 # =========================================================
+# Global toggles
+# =========================================================
+# Disable video sync by default (Shopify cross-store hosted video move is not practical)
+DISABLE_VIDEOS = os.getenv("SYNC_DISABLE_VIDEOS", "1") == "1"
+
+# "Hold" edit tag behaviour while working on TAF product
+HOLD_BEHAVIOUR = os.getenv("SYNC_HOLD_BEHAVIOUR", "skip").lower()  # "skip" | "draft"
+HOLD_TAGS = {"nosync", "no-sync", "do-not-sync", "sync:hold"}
+
+def has_hold_tag(prod: dict) -> bool:
+    tags = (prod.get("tags") or "").lower()
+    return any(t in tags for t in HOLD_TAGS)
+
+# =========================================================
 # Locks, Debounce & Mute
 # =========================================================
 _locks: dict[str, threading.Lock] = {}
@@ -131,7 +145,7 @@ def compute_hash_with_media(store: dict, prod: dict, pid: str | int) -> str:
 # =========================================================
 FIND_BY_SKU = """
 query($q:String!) {
-  productVariants(first: 10, query: $q) {
+  productVariants(first: 25, query: $q) {
     edges { node { id sku product { id title status tags handle } } }
   }
 }
@@ -173,12 +187,8 @@ query($id: ID!, $n: Int!) {
       nodes {
         mediaContentType
         status
-        ... on Video {
-          sources { url mimeType }
-        }
-        ... on ExternalVideo {
-          embeddedUrl
-        }
+        ... on Video { sources { url mimeType } }
+        ... on ExternalVideo { embeddedUrl }
       }
     }
   }
@@ -189,11 +199,24 @@ def find_variant_by_sku(domain: str, token: str, sku: str):
     if not sku:
         return None, None
     data = graphql(domain, token, FIND_BY_SKU, {"q": f"sku:{sku}"})
-    edges = data.get("data", {}).get("productVariants", {}).get("edges", [])
+    edges = data.get("data", {}).get("productVariants", {}).get("edges", []) or []
     if not edges:
         return None, None
     node = edges[0]["node"]
     return node["product"]["id"], node["id"]
+
+def _duplicate_sku_exists(domain: str, token: str, sku: str) -> bool:
+    """True if that SKU appears on 2+ different products on the destination store."""
+    if not sku:
+        return False
+    data = graphql(domain, token, FIND_BY_SKU, {"q": f"sku:{sku}"})
+    edges = data.get("data", {}).get("productVariants", {}).get("edges", []) or []
+    prod_ids = set()
+    for e in edges:
+        pid = (((e or {}).get("node") or {}).get("product") or {}).get("id")
+        if pid:
+            prod_ids.add(pid)
+    return len(prod_ids) > 1
 
 def find_product_id_by_any_sku(domain: str, token: str, skus: list[str]) -> Optional[str]:
     for sku in skus:
@@ -217,9 +240,9 @@ def find_product_id_by_handle(domain: str, token: str, handle: str) -> Optional[
 # REST helpers (products, variants, metafields)
 # =========================================================
 
-# Retry on duplication of get_product
 def get_product_with_retry(domain: str, token: str, pid: int | str, attempts: int = 4, delay: float = 0.8) -> Optional[dict]:
-    for i in range(attempts):
+    """Helps when Shopify fires webhook before duplicate is fully readable."""
+    for _ in range(attempts):
         p = get_product(domain, token, pid)
         if p:
             return p
@@ -648,6 +671,12 @@ def update_variant_price_by_sku(domain: str, token: str, sku: str,
     if not sku:
         return
     _throttle(store_name, min_interval=0.6)
+
+    # Safeguard: skip if duplicate SKU exists on destination
+    if _duplicate_sku_exists(domain, token, sku):
+        warn(f"[price] duplicate SKU '{sku}' on {domain}; skipping price update to avoid cross-product mismatch")
+        return
+
     _, var_gid = find_variant_by_sku(domain, token, sku)
     if not var_gid:
         return
@@ -751,7 +780,7 @@ def sync_variant_skus_from_src_to_dst_by_options(src_prod: dict, dst_store: dict
                                compare_at_price=cap if (also_sync_price and need_price_update) else None)
 
 # =========================================================
-# Media sync (TAF -> AFL) with polling for videos
+# Media sync (images only; videos optional/disabled)
 # =========================================================
 def _list_image_urls(domain: str, token: str, pid: str | int) -> list[str]:
     imgs = list_images(domain, token, pid) or []
@@ -809,8 +838,8 @@ def delete_video_media_only(domain: str, token: str, pid: str | int):
         requests.delete(f"{admin_base(domain)}/products/{pid}/media/{mid}.json",
                         headers=rest_headers(token), timeout=25)
 
+# --- Video helpers (kept but behind toggle) ---
 def _get_media_urls_graphql(domain: str, token: str, pid: str | int, first: int = 30) -> Tuple[List[str], List[str], List[str]]:
-    """Return (hosted_video_urls, external_embed_urls, statuses) via GraphQL."""
     try:
         gid = f"gid://shopify/Product/{pid}"
         resp = graphql(domain, token, MEDIA_QUERY, {"id": gid, "n": first})
@@ -825,7 +854,7 @@ def _get_media_urls_graphql(domain: str, token: str, pid: str | int, first: int 
                     url = s.get("url")
                     if url:
                         hosted.append(url)
-                hosted = list(dict.fromkeys(hosted))  # unique
+                hosted = list(dict.fromkeys(hosted))
             elif mtype == "EXTERNAL_VIDEO":
                 eu = (m.get("embeddedUrl") or "").strip()
                 if eu:
@@ -860,7 +889,6 @@ def _get_media_urls_rest(domain: str, token: str, pid: str | int) -> Tuple[List[
         return [], [], []
 
 def _get_media_urls(domain: str, token: str, pid: str | int) -> Tuple[List[str], List[str]]:
-    """Primary read via GraphQL, fallback to REST if empty."""
     hosted, external, statuses = _get_media_urls_graphql(domain, token, pid)
     if not hosted and not external:
         hosted, external, statuses = _get_media_urls_rest(domain, token, pid)
@@ -875,7 +903,6 @@ def _any_videos_on_product(domain: str, token: str, pid: str | int) -> bool:
     return bool(hosted or external)
 
 def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: int = 60, interval_sec: int = 4) -> Tuple[List[str], List[str]]:
-    """Poll the source for a short period until videos surface (handles .mov/.mp4 processing lag)."""
     hosted, external = _get_media_urls(src_store["domain"], src_store["token"], pid)
     if hosted or external:
         return hosted, external
@@ -891,16 +918,9 @@ def _wait_for_videos_on_source(src_store: dict, pid: str | int, max_wait_sec: in
     return hosted, external
 
 def _staged_upload_create_video(domain: str, token: str, filename: str, file_size: int, mime: str = "video/mp4") -> tuple[str, str, list[dict]]:
-    """Request a staged upload target for a VIDEO. fileSize is REQUIRED."""
     variables = {
         "input": [
-            {
-                "resource": "VIDEO",
-                "filename": filename,
-                "mimeType": mime,
-                "fileSize": int(file_size),
-                "httpMethod": "POST",
-            }
+            {"resource": "VIDEO", "filename": filename, "mimeType": mime, "fileSize": int(file_size), "httpMethod": "POST"}
         ]
     }
     resp = graphql(domain, token, STAGED_UPLOADS_CREATE, variables)
@@ -921,7 +941,6 @@ def _staged_upload_post(url: str, params: list[dict], file_bytes: bytes):
         raise RuntimeError(f"staged upload failed {r.status_code}: {r.text}")
 
 def _download_bytes(url: str) -> tuple[bytes, str, str]:
-    """Download source video bytes. Returns (data, ext, mime)."""
     rr = requests.get(url, stream=True, timeout=120)
     rr.raise_for_status()
     data = rr.content
@@ -942,7 +961,10 @@ def _product_create_media_videos(domain: str, token: str, dst_pid: str | int, vi
             warn(f"[media] productCreateMedia error on {domain}: {e.get('message')} field={e.get('field')}")
 
 def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: str | int):
-    """Mirror videos from TAF -> AFL (external via REST, hosted via staged upload)."""
+    """No-op when disabled; kept for completeness."""
+    if DISABLE_VIDEOS:
+        decide("media: video sync disabled by config")
+        return
     if src_store["name"] != "TAF":
         return
     try:
@@ -954,17 +976,14 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
         info(f"[media] syncing videos (hosted:{len(hosted)} external:{len(external)}) "
              f"{src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
 
-        # wipe only videos on destination
         delete_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
 
-        # external videos
         for u in external[:10]:
             try:
                 create_media_external_video(dst_store["domain"], dst_store["token"], dst_pid, u)
             except Exception as ex:
                 warn(f"[media] external video attach failed on {dst_store['domain']} url={u}: {ex}")
 
-        # hosted videos via staged uploads
         for idx, src_url in enumerate(hosted[:8], start=1):
             try:
                 data, ext, mime = _download_bytes(src_url)
@@ -977,7 +996,6 @@ def _sync_videos(src_store: dict, dst_store: dict, src_pid: str | int, dst_pid: 
             except Exception as inner:
                 warn(f"[media] hosted video copy failed on {dst_store['domain']} src={src_url}: {inner}")
 
-        # brief poll so statuses settle
         t0 = time.time()
         while time.time() - t0 < 45:
             vids = list_video_media_only(dst_store["domain"], dst_store["token"], dst_pid)
@@ -1027,19 +1045,14 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             if not draft_on_dst_by_handle_or_crosslink(src_store, dst_store, {"handle": payload.get("handle", "")}, pid):
                 decide("draft-skip: no match on delete")
             return
-        
-        # Echo suppression: only trust origin on AFL→TAF webhooks.
-        # Old builds may have left origin on TAF; ignore & clean it.
-        origin = get_mf(src_store["domain"], src_store["token"], pid, ORIGIN_NS, ORIGIN_KEY)
 
+        # Echo suppression / clean stale origin
+        origin = get_mf(src_store["domain"], src_store["token"], pid, ORIGIN_NS, ORIGIN_KEY)
         if src_store["name"] == "AFL":
-            # we set origin='TAF' on AFL right before PUT/POST to AFL, so when AFL fires back,
-            # origin will equal dst_store ('TAF') and we safely skip.
             if origin and origin == dst_store["name"]:
                 decide(f"skip: origin marker (origin={origin}) pid={pid}")
                 return
         else:
-            # src_store is TAF — origin should not live here; if it does, purge it so it never blocks sync.
             if origin in ("AFL", "TAF"):
                 mfid = get_mf_id(src_store["domain"], src_store["token"], pid, ORIGIN_NS, ORIGIN_KEY)
                 if mfid:
@@ -1049,6 +1062,15 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
         # Hard gate: only TAF drives product content/inventory mirroring
         if src_store["name"] == "AFL":
             decide("skip: AFL→TAF product content ignored (TAF is source of truth)")
+            return
+
+        # Hold switch while editing on TAF
+        if has_hold_tag(prod):
+            if HOLD_BEHAVIOUR == "draft":
+                drafted = draft_on_dst_by_handle_or_crosslink(src_store, dst_store, prod, pid)
+                decide(f"hold: tag present; drafted={drafted}")
+            else:
+                decide("hold: tag present; skipping all sync for this product")
             return
 
         # Filter: only 'fireplace' products participate; otherwise draft on dst
@@ -1117,14 +1139,14 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                    ORIGIN_NS, ORIGIN_KEY, "single_line_text_field", src_store["name"])
             _put_product_with_retry(dst_store["domain"], dst_store["token"], product_payload)
 
-            # Status decision (draft if force_draft or no SKU; otherwise active)
+            # Status decision
             sku_ready = _sku_ready(prod)
             decide(f"status-decision(update): force_draft={force_draft} sku_ready={sku_ready}")
             target_status = "draft" if (force_draft or not sku_ready) else "active"
             ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
             decide(f"status={target_status} result={ok}")
 
-            # Ensure SKUs, then mirror inventory & prices (TAF -> AFL only)
+            # Ensure SKUs, then mirror inventory & prices
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
             if _sku_ready(prod):
                 mirror_inventory_values_from_src_to_dst(
@@ -1135,7 +1157,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             _mute_for(_key(dst_store["name"], dst_pid), MUTE_SEC)
 
         else:
-            # CREATE (TAF only)
+            # CREATE
             info(f"[{src_store['name']} ➝ {dst_store['name']}] creating new product")
             product_payload["product"]["variants"] = [
                 {
@@ -1180,14 +1202,12 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 warn(f"[{src_store['name']} ➝ {dst_store['name']}] no dst PID after create/update, abort media/inventory")
                 return
 
-            # Status decision on create
             sku_ready = _sku_ready(prod)
             decide(f"status-decision(create): force_draft={force_draft} sku_ready={sku_ready}")
             target_status = "draft" if (force_draft or not sku_ready) else "active"
             ok = _set_product_status(dst_store["domain"], dst_store["token"], dst_pid, target_status)
             decide(f"status={target_status} result={ok}")
 
-            # Ensure SKUs then mirror inventory & prices (TAF -> AFL)
             sync_variant_skus_from_src_to_dst_by_options(prod, dst_store, dst_pid, also_sync_price=False)
             if _sku_ready(prod):
                 mirror_inventory_values_from_src_to_dst(
@@ -1195,8 +1215,10 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 )
                 sync_variant_prices_from_src_to_dst(prod, dst_store)
 
-        # Media (TAF -> AFL)
-        hosted, external = _wait_for_videos_on_source(src_store, pid, max_wait_sec=45, interval_sec=3)
+        # Media (images always; videos only if enabled)
+        hosted, external = [], []
+        if not DISABLE_VIDEOS:
+            hosted, external = _wait_for_videos_on_source(src_store, pid, max_wait_sec=45, interval_sec=3)
         decide(f"media: images={len(_norm_images(prod))} hosted_videos={len(hosted)} external_videos={len(external)}")
         _sync_images(src_store, dst_store, prod, dst_pid)
         _sync_videos(src_store, dst_store, pid, dst_pid)
@@ -1206,7 +1228,6 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
         set_mf(src_store["domain"], src_store["token"], pid, "sync", "last_hash",
                "single_line_text_field", compute_hash_with_media(src_store, prod, pid))
 
-        # clear echo marker on dst
         mfid = get_mf_id(dst_store["domain"], dst_store["token"], dst_pid, ORIGIN_NS, ORIGIN_KEY)
         if mfid:
             delete_mf(dst_store["domain"], dst_store["token"], mfid)
