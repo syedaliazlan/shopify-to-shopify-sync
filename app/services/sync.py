@@ -74,7 +74,8 @@ def has_fireplace_tag(prod: dict) -> bool:
     return "fireplace" in (prod.get("tags", "") or "").lower()
 
 def _norm_images(prod: dict) -> List[str]:
-    return [img.get("src") for img in (prod.get("images") or []) if img.get("src")][:20]
+    """Extract all image URLs from a product (no artificial limit)."""
+    return [img.get("src") for img in (prod.get("images") or []) if img.get("src")]
 
 def compute_hash(prod: dict) -> str:
     body = {
@@ -316,12 +317,25 @@ def delete_all_images(domain: str, token: str, pid: str | int):
         requests.delete(f"{admin_base(domain)}/products/{pid}/images/{iid}.json",
                         headers=rest_headers(token), timeout=25)
 
+class ImageUploadError(Exception):
+    """Raised when image upload fails with a retryable error."""
+    pass
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=8),
+    retry=retry_if_exception_type(ImageUploadError),
+)
 def add_image(domain: str, token: str, pid: str | int, src: str, position: int, alt: Optional[str] = None):
     payload = {"image": {"src": src, "position": position}}
     if alt:
         payload["image"]["alt"] = alt
     r = requests.post(f"{admin_base(domain)}/products/{pid}/images.json",
-                      headers=rest_headers(token), json=payload, timeout=60)
+                      headers=rest_headers(token), json=payload, timeout=90)
+    if r.status_code in (429, 502, 503, 504):
+        # Retryable errors - rate limit or server errors
+        raise ImageUploadError(f"Retryable error {r.status_code}: {r.text}")
     if r.status_code not in (200, 201):
         warn(f"[media] add_image failed on {domain} pid={pid} pos={position}: {r.status_code} {r.text}")
 
@@ -604,6 +618,51 @@ def adjust_inventory_by_sku(domain: str, token: str, sku: str, delta: int, locat
     if rr.status_code not in (200, 201):
         warn(f"[inventory] Adjust failed for {sku} on {domain}: {rr.status_code} {rr.text}")
 
+def get_sku_from_inventory_item_id(domain: str, token: str, inventory_item_id: int | str) -> Optional[str]:
+    """Look up the SKU for a given inventory_item_id by querying the inventory item."""
+    r = requests.get(f"{admin_base(domain)}/inventory_items/{inventory_item_id}.json",
+                     headers=rest_headers(token), timeout=20)
+    if r.status_code != 200:
+        warn(f"[inventory] Could not read inventory_item {inventory_item_id} on {domain}: {r.text}")
+        return None
+    inv_item = r.json().get("inventory_item") or {}
+    sku = (inv_item.get("sku") or "").strip()
+    return sku if sku else None
+
+def handle_inventory_level_update(src_store: dict, dst_store: dict, payload: dict):
+    """
+    Handle inventory_levels/update webhook from src_store, sync to dst_store.
+    Payload contains: inventory_item_id, location_id, available, updated_at
+    """
+    inventory_item_id = payload.get("inventory_item_id")
+    available = payload.get("available")
+    location_id = payload.get("location_id")
+    
+    if inventory_item_id is None or available is None:
+        debug(f"[inventory] Missing inventory_item_id or available in payload")
+        return
+    
+    # Check if this location matches our configured location (if configured)
+    src_location = src_store.get("location_id")
+    if src_location and str(location_id) != str(src_location):
+        debug(f"[inventory] Ignoring inventory update for location {location_id} (configured: {src_location})")
+        return
+    
+    # Look up SKU from inventory_item_id
+    sku = get_sku_from_inventory_item_id(src_store["domain"], src_store["token"], inventory_item_id)
+    if not sku:
+        debug(f"[inventory] No SKU found for inventory_item_id {inventory_item_id}")
+        return
+    
+    info(f"[inventory] {src_store['name']} -> {dst_store['name']}: SKU={sku} available={available}")
+    
+    # Set absolute inventory on destination store
+    set_absolute_inventory_by_sku(
+        dst_store["domain"], dst_store["token"], 
+        sku, int(available), 
+        dst_store.get("location_id")
+    )
+
 def mirror_inventory_values_from_src_to_dst(
     src_store: dict,
     dst_store: dict,
@@ -788,8 +847,9 @@ def _list_image_urls(domain: str, token: str, pid: str | int) -> list[str]:
     return [(im.get("src") or "").strip() for im in imgs]
 
 def _src_images_with_alt(prod: dict) -> list[tuple[str, str]]:
+    """Extract all images with alt text from a product (no artificial limit)."""
     out = []
-    for im in (prod.get("images") or [])[:20]:
+    for im in (prod.get("images") or []):
         src = (im.get("src") or "").strip()
         if not src:
             continue
@@ -814,6 +874,9 @@ def _sync_images(src_store: dict, dst_store: dict, src_prod: dict, dst_pid: str 
         delete_all_images(dst_store["domain"], dst_store["token"], dst_pid)
         for idx, (src, alt) in enumerate(src_imgs, start=1):
             add_image(dst_store["domain"], dst_store["token"], dst_pid, src, idx, alt=alt or None)
+            # Throttle between image uploads to avoid Shopify rate limiting
+            if idx < len(src_imgs):
+                time.sleep(0.5)
     except Exception as e:
         warn(f"[media] image sync error: {e}")
 
@@ -1081,12 +1144,14 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
             return
 
         # Availability (draft instead of delete)
+        # Only force draft if TAF status is explicitly draft/archived
+        # Don't draft solely based on inventory being 0 - inventory syncs separately
         force_draft = False
         taf_total_avail = product_total_available(src_store["domain"], src_store["token"], prod, src_store.get("location_id"))
         decide(f"availability: status={prod.get('status')} total_avail={taf_total_avail} pid={pid}")
-        if prod.get("status") in ("draft", "archived") or taf_total_avail <= 0:
+        if prod.get("status") in ("draft", "archived"):
             force_draft = True
-            decide("will draft on AFL, but continue syncing fields (price/tags/inventory/media)")
+            decide("will draft on AFL (TAF status is draft/archived), but continue syncing fields")
 
         # Hash (include media on TAF)
         new_hash = compute_hash_with_media(src_store, prod, pid)

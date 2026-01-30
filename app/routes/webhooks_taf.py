@@ -11,6 +11,7 @@ from ..services.sync import (
     handle_product_event,
     mirror_sale_to_other_store,
     mirror_cancel_to_other_store,
+    handle_inventory_level_update,
 )
 
 bp = Blueprint("webhooks_taf", __name__)
@@ -86,8 +87,18 @@ def inventory():
     if _seen(webhook_id):
         return "OK", 200
 
-    verify_webhook_hmac(TAF["secret"])
-    info("[TAF] /inventory webhook received.")
+    raw = verify_webhook_hmac(TAF["secret"])
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    inv_item_id = payload.get("inventory_item_id")
+    info(f"[TAF] /inventory webhook received. inventory_item_id={inv_item_id}")
+
+    def worker():
+        try:
+            handle_inventory_level_update(TAF, AFL, payload)
+        except Exception as e:
+            error(f"[TAF ➝ AFL] inventory worker inv_item_id={inv_item_id}: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
     return "OK", 200
 
 
