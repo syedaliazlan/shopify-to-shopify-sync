@@ -335,9 +335,12 @@ def add_image(domain: str, token: str, pid: str | int, src: str, position: int, 
                       headers=rest_headers(token), json=payload, timeout=90)
     if r.status_code in (429, 502, 503, 504):
         # Retryable errors - rate limit or server errors
+        warn(f"[image-upload] RETRY: {r.status_code} for pid={pid} pos={position}")
         raise ImageUploadError(f"Retryable error {r.status_code}: {r.text}")
     if r.status_code not in (200, 201):
-        warn(f"[media] add_image failed on {domain} pid={pid} pos={position}: {r.status_code} {r.text}")
+        warn(f"[image-upload] FAILED: pid={pid} pos={position} status={r.status_code} error={r.text}")
+    else:
+        debug(f"[image-upload] OK: pid={pid} pos={position}")
 
 def list_media(domain: str, token: str, pid: str | int) -> list[dict]:
     r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
@@ -553,34 +556,40 @@ def ensure_tracking_enabled_on_product(domain: str, token: str, pid: str | int):
 
 def set_absolute_inventory_by_sku(domain: str, token: str, sku: str, qty: int, location_id_legacy: Optional[str]):
     if qty is None or not sku:
+        warn(f"[inventory-set] SKIP: Missing qty or sku. sku={sku}, qty={qty}")
         return
     _, var_gid = find_variant_by_sku(domain, token, sku)
     if not var_gid:
+        warn(f"[inventory-set] SKIP: No variant found for SKU={sku} on {domain}")
         return
     variant_id = var_gid.split("/")[-1]
     r = requests.get(f"{admin_base(domain)}/variants/{variant_id}.json",
                      headers=rest_headers(token), timeout=20)
     if r.status_code != 200:
+        warn(f"[inventory-set] SKIP: Could not fetch variant {variant_id} on {domain}: {r.status_code}")
         return
     variant = (r.json().get("variant") or {})
     inventory_item_id = variant.get("inventory_item_id")
     if not inventory_item_id:
+        warn(f"[inventory-set] SKIP: No inventory_item_id for variant {variant_id} on {domain}")
         return
 
     if not location_id_legacy:
         location_id_legacy = _primary_location_id(domain, token)
     if not location_id_legacy:
+        warn(f"[inventory-set] SKIP: No location_id available for {domain}")
         return
 
     # Skip if equal (no-op) and suppress recent identical sets
     current = _current_available_for_item(domain, token, inventory_item_id, location_id_legacy)
     if current is not None and int(current) == int(qty):
-        debug(f"[inventory] noop set skipped for {sku} on {domain}: {current} == {qty}")
+        info(f"[inventory-set] NOOP: SKU={sku} on {domain} already has qty={qty}")
         return
     if _recently_set_same_qty(domain, sku, qty):
-        debug(f"[inventory] recent identical set suppressed for {sku} on {domain}: {qty}")
+        info(f"[inventory-set] THROTTLE: Recent identical set suppressed for SKU={sku} on {domain}: qty={qty}")
         return
 
+    info(f"[inventory-set] Setting SKU={sku} on {domain}: {current} -> {qty}")
     _connect_level_if_needed(domain, token, inventory_item_id, location_id_legacy)
     payload = {"location_id": int(location_id_legacy),
                "inventory_item_id": int(inventory_item_id),
@@ -588,35 +597,45 @@ def set_absolute_inventory_by_sku(domain: str, token: str, sku: str, qty: int, l
     rr = requests.post(f"{admin_base(domain)}/inventory_levels/set.json",
                        headers=rest_headers(token), json=payload, timeout=20)
     if rr.status_code not in (200, 201):
-        warn(f"[inventory] set failed for {sku} on {domain}: {rr.status_code} {rr.text}")
+        warn(f"[inventory-set] FAILED for SKU={sku} on {domain}: {rr.status_code} {rr.text}")
+    else:
+        info(f"[inventory-set] SUCCESS: SKU={sku} on {domain} set to qty={qty}")
 
 def adjust_inventory_by_sku(domain: str, token: str, sku: str, delta: int, location_id_legacy: Optional[str]):
     if not sku or not delta:
+        warn(f"[inventory-adjust] SKIP: Missing sku or delta. sku={sku}, delta={delta}")
         return
+    info(f"[inventory-adjust] Looking up SKU={sku} on {domain}...")
     _, var_gid = find_variant_by_sku(domain, token, sku)
     if not var_gid:
-        warn(f"[inventory] No variant for SKU {sku} on {domain}")
+        warn(f"[inventory-adjust] SKIP: No variant found for SKU={sku} on {domain}")
         return
     variant_id = var_gid.split("/")[-1]
     r = requests.get(f"{admin_base(domain)}/variants/{variant_id}.json",
                      headers=rest_headers(token), timeout=20)
     if r.status_code != 200:
-        warn(f"[inventory] Could not read variant {variant_id} on {domain}: {r.text}")
+        warn(f"[inventory-adjust] SKIP: Could not read variant {variant_id} on {domain}: {r.text}")
         return
     inventory_item_id = (r.json().get("variant") or {}).get("inventory_item_id")
     if not inventory_item_id:
+        warn(f"[inventory-adjust] SKIP: No inventory_item_id for variant {variant_id}")
         return
     if not location_id_legacy:
         location_id_legacy = _primary_location_id(domain, token)
     if not location_id_legacy:
+        warn(f"[inventory-adjust] SKIP: No location_id available for {domain}")
         return
+    
+    info(f"[inventory-adjust] Adjusting SKU={sku} on {domain} by delta={delta}")
     adj = {"location_id": int(location_id_legacy),
            "inventory_item_id": int(inventory_item_id),
            "available_adjustment": int(delta)}
     rr = requests.post(f"{admin_base(domain)}/inventory_levels/adjust.json",
                        headers=rest_headers(token), json=adj, timeout=20)
     if rr.status_code not in (200, 201):
-        warn(f"[inventory] Adjust failed for {sku} on {domain}: {rr.status_code} {rr.text}")
+        warn(f"[inventory-adjust] FAILED for SKU={sku} on {domain}: {rr.status_code} {rr.text}")
+    else:
+        info(f"[inventory-adjust] SUCCESS: SKU={sku} on {domain} adjusted by {delta}")
 
 def get_sku_from_inventory_item_id(domain: str, token: str, inventory_item_id: int | str) -> Optional[str]:
     """Look up the SKU for a given inventory_item_id by querying the inventory item."""
@@ -638,23 +657,26 @@ def handle_inventory_level_update(src_store: dict, dst_store: dict, payload: dic
     available = payload.get("available")
     location_id = payload.get("location_id")
     
+    info(f"[inventory-sync] {src_store['name']} webhook received: inventory_item_id={inventory_item_id}, location_id={location_id}, available={available}")
+    
     if inventory_item_id is None or available is None:
-        debug(f"[inventory] Missing inventory_item_id or available in payload")
+        warn(f"[inventory-sync] SKIP: Missing inventory_item_id or available in payload. Full payload: {payload}")
         return
     
     # Check if this location matches our configured location (if configured)
     src_location = src_store.get("location_id")
     if src_location and str(location_id) != str(src_location):
-        debug(f"[inventory] Ignoring inventory update for location {location_id} (configured: {src_location})")
+        info(f"[inventory-sync] SKIP: Location mismatch. Webhook location={location_id}, configured={src_location}")
         return
     
     # Look up SKU from inventory_item_id
+    info(f"[inventory-sync] Looking up SKU for inventory_item_id={inventory_item_id} on {src_store['name']}...")
     sku = get_sku_from_inventory_item_id(src_store["domain"], src_store["token"], inventory_item_id)
     if not sku:
-        debug(f"[inventory] No SKU found for inventory_item_id {inventory_item_id}")
+        warn(f"[inventory-sync] SKIP: No SKU found for inventory_item_id={inventory_item_id}. Item may not have a SKU assigned.")
         return
     
-    info(f"[inventory] {src_store['name']} -> {dst_store['name']}: SKU={sku} available={available}")
+    info(f"[inventory-sync] Found SKU={sku}. Syncing {src_store['name']} -> {dst_store['name']}: available={available}")
     
     # Set absolute inventory on destination store
     set_absolute_inventory_by_sku(
@@ -662,6 +684,7 @@ def handle_inventory_level_update(src_store: dict, dst_store: dict, payload: dic
         sku, int(available), 
         dst_store.get("location_id")
     )
+    info(f"[inventory-sync] COMPLETE: {src_store['name']} -> {dst_store['name']} SKU={sku} qty={available}")
 
 def mirror_inventory_values_from_src_to_dst(
     src_store: dict,
@@ -859,26 +882,41 @@ def _src_images_with_alt(prod: dict) -> list[tuple[str, str]]:
 def _sync_images(src_store: dict, dst_store: dict, src_prod: dict, dst_pid: str | int):
     # images only flow TAF -> AFL
     if src_store["name"] != "TAF":
+        info(f"[image-sync] SKIP: Only TAF->AFL image sync is enabled. Source={src_store['name']}")
         return
     src_imgs = _src_images_with_alt(src_prod)
     if not src_imgs:
-        info(f"[media] no images on source; skipping image sync for dst pid {dst_pid}")
+        info(f"[image-sync] SKIP: No images on source product. dst_pid={dst_pid}")
         return
+    
+    info(f"[image-sync] Starting: {len(src_imgs)} images found on TAF product '{src_prod.get('title', 'unknown')}'")
+    
     try:
         dst_urls = _list_image_urls(dst_store["domain"], dst_store["token"], dst_pid)
         src_urls = [u for (u, _alt) in src_imgs]
         if dst_urls == src_urls:
-            debug(f"[media] images already in sync for dst pid {dst_pid}; skipping")
+            info(f"[image-sync] NOOP: All {len(src_imgs)} images already in sync for dst_pid={dst_pid}")
             return
-        info(f"[media] syncing {len(src_imgs)} images {src_store['name']} -> {dst_store['name']} (dst pid {dst_pid})")
+        
+        info(f"[image-sync] Syncing {len(src_imgs)} images TAF -> AFL (dst_pid={dst_pid}). Current dst has {len(dst_urls)} images.")
+        info(f"[image-sync] Deleting existing images on AFL dst_pid={dst_pid}...")
         delete_all_images(dst_store["domain"], dst_store["token"], dst_pid)
+        
+        success_count = 0
         for idx, (src, alt) in enumerate(src_imgs, start=1):
-            add_image(dst_store["domain"], dst_store["token"], dst_pid, src, idx, alt=alt or None)
+            info(f"[image-sync] Uploading image {idx}/{len(src_imgs)}: position={idx}")
+            try:
+                add_image(dst_store["domain"], dst_store["token"], dst_pid, src, idx, alt=alt or None)
+                success_count += 1
+            except Exception as img_err:
+                warn(f"[image-sync] FAILED image {idx}/{len(src_imgs)}: {img_err}")
             # Throttle between image uploads to avoid Shopify rate limiting
             if idx < len(src_imgs):
                 time.sleep(0.5)
+        
+        info(f"[image-sync] COMPLETE: {success_count}/{len(src_imgs)} images uploaded to dst_pid={dst_pid}")
     except Exception as e:
-        warn(f"[media] image sync error: {e}")
+        error(f"[image-sync] ERROR during sync: {e}")
 
 def list_video_media_only(domain: str, token: str, pid: str | int) -> list[dict]:
     r = requests.get(f"{admin_base(domain)}/products/{pid}/media.json",
@@ -1309,9 +1347,9 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
 # Order-driven inventory sync (two-way, delta-based)
 # =========================================================
 def mirror_sale_to_other_store(other_store: dict, sku: str, qty: int, other_location_legacy_id: Optional[str]):
-    info(f"[orders] {other_store['name']} adjust {sku} -{qty}")
+    info(f"[order-sale] Processing sale: deduct {qty} from SKU={sku} on {other_store['name']}")
     adjust_inventory_by_sku(other_store["domain"], other_store["token"], sku, -abs(qty), other_location_legacy_id)
 
 def mirror_cancel_to_other_store(other_store: dict, sku: str, qty: int, other_location_legacy_id: Optional[str]):
-    info(f"[orders] {other_store['name']} adjust {sku} +{qty}")
+    info(f"[order-cancel] Processing cancellation: restore {qty} to SKU={sku} on {other_store['name']}")
     adjust_inventory_by_sku(other_store["domain"], other_store["token"], sku, +abs(qty), other_location_legacy_id)
