@@ -1225,6 +1225,7 @@ def handle_product_event(src_store: dict, dst_store: dict, payload: dict):
                 "tags": prod.get("tags", ""),
                 "status": prod.get("status", "active"),
                 "handle": prod.get("handle"),
+                "published": True,  # Publish to Online Store sales channel
             }
         }
         created_now = False
